@@ -33,7 +33,7 @@ recordings/
 node_modules/
 *.tsbuildinfo
 
-model/segformer_b1_ade/*.bin
-model/whisper/*.pt
-model/*.pt
-mobileclip_blt.ts
+# model/segformer-b1-ade/*.bin
+# model/whisper/*.pt
+# model/*.pt
+# mobileclip_blt.ts
