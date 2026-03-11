@@ -24,7 +24,6 @@ dist/
 
 # Data / recordings / models (large, can be re-downloaded)
 recordings/
-model/
 
 # Local runtime files
 *.tmp
