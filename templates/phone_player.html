@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>手机语音播报 - AIGlass</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: #0f1419;
+      color: #e6edf3;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    h1 { font-size: 1.25rem; margin-bottom: 8px; color: #7ee787; }
+    p { font-size: 14px; color: #9fb0c3; margin: 0 0 20px; text-align: center; }
+    .status {
+      padding: 12px 20px;
+      border-radius: 12px;
+      background: rgba(255,255,255,.06);
+      margin-bottom: 16px;
+      font-size: 14px;
+      min-width: 200px;
+      text-align: center;
+    }
+    .status.connected { background: rgba(126,231,135,.15); color: #7ee787; }
+    .status.error { background: rgba(255,128,128,.15); color: #ff8080; }
+    .hint { font-size: 12px; color: #6e7a8a; margin-top: 24px; max-width: 280px; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1>手机语音播报</h1>
+  <p>连接服务端语音流，AI 回复将在此播放</p>
+  <div id="status" class="status">正在连接…</div>
+  <p class="hint">请保持本页打开并允许自动播放。若 darksight app 支持网络流，可直接播放：<br><code id="url"></code></p>
+  <audio id="audio" autoplay playsinline></audio>
+
+  <script>
+    (function () {
+      var host = location.host;
+      var streamUrl = location.protocol + "//" + host + "/stream_phone.wav";
+      document.getElementById("url").textContent = streamUrl;
+
+      var statusEl = document.getElementById("status");
+      var audio = document.getElementById("audio");
+
+      function setStatus(msg, className) {
+        statusEl.textContent = msg;
+        statusEl.className = "status" + (className ? " " + className : "");
+      }
+
+      audio.addEventListener("playing", function () {
+        setStatus("已连接，等待语音…", "connected");
+      });
+      audio.addEventListener("error", function (e) {
+        setStatus("连接失败或已断开", "error");
+      });
+      audio.addEventListener("ended", function () {
+        setStatus("已连接，等待语音…", "connected");
+      });
+
+      audio.src = streamUrl;
+      audio.load();
+      audio.play().catch(function () {
+        setStatus("请点击页面后重试（浏览器需允许自动播放）", "error");
+      });
+    })();
+  </script>
+</body>
+</html>

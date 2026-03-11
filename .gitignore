@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Virtual env
+venv/
+.env
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Build / cache
+*.egg-info/
+*.dist-info/
+.eggs/
+build/
+dist/
+
+# Data / recordings / models (large, can be re-downloaded)
+recordings/
+model/
+
+# Local runtime files
+*.tmp
+*.bak
+
+# Node / TypeScript (if used later)
+node_modules/
+*.tsbuildinfo
+
+model/segformer_b1_ade/*.bin
+model/whisper/*.pt
+model/*.pt
+mobileclip_blt.ts
