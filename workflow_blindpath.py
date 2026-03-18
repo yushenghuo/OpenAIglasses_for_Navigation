@@ -90,15 +90,17 @@ class ProcessingResult:
 class BlindPathNavigator:
     """盲道/可通行区域导航处理器 - 无外部依赖版本"""
     
-    def __init__(self, seg_model_bundle=None, obstacle_detector=None):
+    def __init__(self, seg_model_bundle=None, obstacle_detector=None, crosswalk_seg_model=None):
         """
         初始化导航器
         :param seg_model_bundle: 分割模型打包对象（例如 SegFormer 的 processor+model+device）
         :param obstacle_detector: 障碍物检测器（可选）
+        :param crosswalk_seg_model: 斑马线专用分割模型（建议 YOLO 分割）
         """
         # seg_model_bundle 预期为 dict: {"processor": ..., "model": ..., "device": ...}
         self.seg_model_bundle = seg_model_bundle
         self.obstacle_detector = obstacle_detector
+        self.crosswalk_seg_model = crosswalk_seg_model
         
         # 状态变量
         self.current_state = STATE_ONBOARDING
@@ -182,6 +184,14 @@ class BlindPathNavigator:
         self.last_direction_time = 0.0
         self.last_direction_message = ""
         
+        # 斑马线检测节流：导航阶段按时间抽帧（默认约 1fps，可通过环境变量调整）
+        try:
+            self.crosswalk_interval_nav_sec: float = float(os.getenv("AIGLASS_CW_NAV_INTERVAL", "1.0"))
+        except Exception:
+            self.crosswalk_interval_nav_sec = 1.0
+        self.last_crosswalk_detect_ts: float = 0.0
+        self.last_crosswalk_mask: Optional[np.ndarray] = None
+
         # 打印配置信息
         logger.info(f"[BlindPath] 直行播报配置: 间隔={self.guide_interval}秒, "
                    f"持续模式={self.straight_continuous_mode}, "
@@ -205,13 +215,32 @@ class BlindPathNavigator:
         # 障碍物语音待播报
         self.pending_obstacle_voice = None
 
-        # 【可通行区域边界安全】仅靠近人行道边界时提醒，方向/转弯由高德/谷歌负责
+        # 【可通行区域边界安全】仅「明显靠近」人行道边界时提醒，大部分时间保持安静
         self.boundary_warn_state = "none"  # none / warn_left / warn_right
-        self.boundary_enter = float(os.getenv("AIGLASS_BOUNDARY_ENTER", "0.22"))   # 进入提醒：边距 < 此值
-        self.boundary_exit = float(os.getenv("AIGLASS_BOUNDARY_EXIT", "0.32"))    # 退出提醒：边距 > 此值
-        self.boundary_change_interval = float(os.getenv("AIGLASS_GUIDE_CHANGE_INTERVAL", "2.0"))
+        # 进入/退出阈值：越小表示离边界越近；只在 margin 足够小才触发
+        self.boundary_enter = float(os.getenv("AIGLASS_BOUNDARY_ENTER", "0.18"))   # 进入提醒：边距 < 此值
+        self.boundary_exit = float(os.getenv("AIGLASS_BOUNDARY_EXIT", "0.30"))    # 退出提醒：边距 > 此值
+        # 同侧/换侧提醒之间至少间隔 4 秒，避免来回“吵闹”
+        self.boundary_change_interval = float(os.getenv("AIGLASS_GUIDE_CHANGE_INTERVAL", "4.0"))
         self.last_boundary_warn_time = 0.0
         self.boundary_margin_history = deque(maxlen=15)  # 平滑用
+        # 脚前带：像素裕度 + 连续帧滞回 + 冷却
+        self.foot_band_y_lo = float(os.getenv("AIGLASS_FOOT_BAND_Y_LO", "0.65"))
+        self.foot_band_y_hi = float(os.getenv("AIGLASS_FOOT_BAND_Y_HI", "1.0"))
+        self.warn_px = int(os.getenv("AIGLASS_BOUNDARY_WARN_PX", "35"))
+        self.boundary_exit_px = int(os.getenv("AIGLASS_BOUNDARY_EXIT_PX", "55"))
+        self.on_path_min_ratio = float(os.getenv("AIGLASS_ON_PATH_MIN_RATIO", "0.18"))
+        self.center_offset_px_thr = int(os.getenv("AIGLASS_CENTER_OFFSET_PX_THR", "50"))
+        self.boundary_consecutive_required = int(os.getenv("AIGLASS_BOUNDARY_CONSECUTIVE", "4"))
+        self.boundary_cooldown_sec = float(os.getenv("AIGLASS_BOUNDARY_COOLDOWN", "2.5"))
+        self.boundary_warn_consecutive_count = 0
+        self.boundary_warn_consecutive_side = None  # "warn_left" / "warn_right"
+        self.heading_error_history = deque(maxlen=9)
+        self.heading_warn_state = "none"  # none / turn_left / turn_right
+        self.heading_enter_deg = float(os.getenv("AIGLASS_HEADING_ENTER_DEG", "12.0"))
+        self.heading_exit_deg = float(os.getenv("AIGLASS_HEADING_EXIT_DEG", "7.0"))
+        self.nav_command_history = deque(maxlen=6)
+        self.nav_command_stable_count = int(os.getenv("AIGLASS_NAV_CMD_STABLE_COUNT", "3"))
         
         # 红绿灯检测
         self.traffic_light_detector = None
@@ -247,8 +276,26 @@ class BlindPathNavigator:
         self.WALKABLE_TEMPORAL_ALPHA = float(os.getenv("AIGLASS_WALKABLE_TEMPORAL_ALPHA", "0.4"))
         self.walkable_ema: Optional[np.ndarray] = None
         self.walkable_ema_shape: Optional[Tuple[int, int]] = None
+        self.walkable_binary_history = deque(
+            maxlen=max(3, int(os.getenv("AIGLASS_WALKABLE_VOTE_HISTORY", "5")))
+        )
+        self.walkable_prev_final: Optional[np.ndarray] = None
+        self.walkable_prev_shape: Optional[Tuple[int, int]] = None
+        self.walkable_glitch_count = 0
+        self.WALKABLE_GLITCH_HOLD_FRAMES = int(os.getenv("AIGLASS_WALKABLE_GLITCH_HOLD", "3"))
+        self.WALKABLE_JUMP_IOU_THR = float(os.getenv("AIGLASS_WALKABLE_JUMP_IOU_THR", "0.12"))
+        self.WALKABLE_JUMP_CENTER_THR = float(os.getenv("AIGLASS_WALKABLE_JUMP_CENTER_THR", "0.18"))
+        self.WALKABLE_JUMP_AREA_THR = float(os.getenv("AIGLASS_WALKABLE_JUMP_AREA_THR", "0.22"))
+        self.WALKABLE_ROW_SMOOTH_WIN = int(os.getenv("AIGLASS_WALKABLE_ROW_SMOOTH_WIN", "15"))
+        self.WALKABLE_MIN_ROW_COVERAGE_RATIO = float(
+            os.getenv("AIGLASS_WALKABLE_MIN_ROW_COVERAGE_RATIO", "0.25")
+        )
+        self.WALKABLE_MIN_VALID_ROWS_RATIO = float(
+            os.getenv("AIGLASS_WALKABLE_MIN_VALID_ROWS_RATIO", "0.18")
+        )
         # 走廊矩形左右边界的 EMA，用于输出稳定长方形可通行区域
         self.CORRIDOR_EMA_ALPHA = float(os.getenv("AIGLASS_WALK_CORRIDOR_ALPHA", "0.35"))
+        self.CORRIDOR_MAX_DELTA_RATIO = float(os.getenv("AIGLASS_WALK_CORRIDOR_MAX_DELTA", "0.08"))
         self.corridor_left_ema: Optional[float] = None
         self.corridor_right_ema: Optional[float] = None
         
@@ -432,6 +479,7 @@ class BlindPathNavigator:
         :param image: BGR格式的图像
         :return: 处理结果
         """
+        t0 = time.time()
         self.frame_counter += 1
         
         # 更新冷却期
@@ -450,6 +498,7 @@ class BlindPathNavigator:
         
         # 1. 【修改为实时检测】每帧都进行YOLO检测，不使用缓存
         blind_path_mask, crosswalk_mask = self._detect_path_and_crosswalk(image)
+        t_yolo = time.time()
         
         # 【调试】检查YOLO检测结果
         if self.frame_counter % 30 == 0:  # 每30帧打印一次
@@ -491,6 +540,7 @@ class BlindPathNavigator:
             else:
                 detected_obstacles = []
                 logger.info(f"[Frame {self.frame_counter}] 缓存过期，无障碍物数据")
+        t_obstacle = time.time()
         
         # 添加所有障碍物的可视化（不只是近距离的）
         for i, obs in enumerate(detected_obstacles):
@@ -516,6 +566,7 @@ class BlindPathNavigator:
                 logger.info(f"[斑马线] crosswalk_mask为None")
         
         crosswalk_guidance = self.crosswalk_monitor.process_frame(crosswalk_mask, blind_path_mask)
+        t_cross = time.time()
         if crosswalk_guidance:
             logger.info(f"[斑马线感知] 检测结果: area={crosswalk_guidance.get('area', 0):.3f}, "
                        f"should_broadcast={crosswalk_guidance.get('should_broadcast', False)}, "
@@ -553,8 +604,8 @@ class BlindPathNavigator:
                 self._add_crosswalk_info_visualization(viz_data, image_height, image_width, 
                                                       frame_visualizations)
         
-        # 【已禁用】4. 更新斑马线追踪器 - 盲道导航不再跳转到斑马线
-        # self._update_crosswalk_tracker(crosswalk_mask, image_height, image_width)
+        # 更新斑马线追踪器：仅用于阶段/对正信息输出，不在本工作流内强制切状态
+        self._update_crosswalk_tracker(crosswalk_mask, image_height, image_width)
         
         # 5. 添加路径可视化
         # 【恢复】盲道mask可视化
@@ -562,9 +613,8 @@ class BlindPathNavigator:
         # 【斑马线可视化由crosswalk_monitor处理，不在这里添加】
         
 
-        # 【已禁用】5. 根据状态执行不同的导航逻辑 - 盲道导航不再处理斑马线
-        current_stage = 'not_detected'  # 固定为不检测斑马线
-        # current_stage = self.crosswalk_tracker['stage']  # 已禁用
+        # 当前斑马线阶段（输出给 NavigationMaster 作上层决策）
+        current_stage = self.crosswalk_tracker.get('stage', 'not_detected')
         
         # 直接进行盲道导航，不检查斑马线状态
         if False:  # current_stage == 'ready':
@@ -801,8 +851,24 @@ class BlindPathNavigator:
         # 添加底部指令按钮（显示当前实际播报的语音）
         current_instruction = final_guidance_text if final_guidance_text else "等待中..."
         annotated_image = self._draw_command_button(annotated_image, current_instruction)
-        
-        # 8. 返回结果
+
+        # # 8. 性能分析日志（按帧输出关键阶段耗时）
+        # t_end = time.time()
+        # try:
+        #     yolo_ms = (t_yolo - t0) * 1000.0
+        #     obst_ms = (t_obstacle - t_yolo) * 1000.0
+        #     cross_ms = (t_cross - t_obstacle) * 1000.0
+        #     total_ms = (t_end - t0) * 1000.0
+        #     # 直接打印到标准输出，确保在终端可见
+        #     print(
+        #         f"[BLINDPATH-PROFILE] frame={self.frame_counter} "
+        #         f"yolo={yolo_ms:.1f}ms obst={obst_ms:.1f}ms cross={cross_ms:.1f}ms total={total_ms:.1f}ms",
+        #         flush=True,
+        #     )
+        # except Exception:
+        #     pass
+
+        # 9. 返回结果
         return ProcessingResult(
             guidance_text=guidance_text,
             visualizations=frame_visualizations,
@@ -810,6 +876,8 @@ class BlindPathNavigator:
             state_info={
                 "state": self.current_state,
                 "crosswalk_stage": current_stage,
+                "last_angle": self.crosswalk_tracker.get("last_angle", 0.0),
+                "last_center_x_ratio": self.crosswalk_tracker.get("last_center_x_ratio", 0.5),
                 "frame_count": self.frame_counter
             }
         )
@@ -817,8 +885,9 @@ class BlindPathNavigator:
     def _detect_path_and_crosswalk(self, image: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """检测可通行区域（替代原盲道+斑马线 YOLO 分割）
 
-        现在使用 SegFormer 语义分割模型，把 road/sidewalk/floor/ground 等类别合并为一个 free-space mask，
-        作为后续导航的「可通行区域」输入；暂时不再单独输出斑马线 mask。
+        现在使用 SegFormer 语义分割模型：
+        - 可通行区域仅保留 sidewalk；
+        - 斑马线由专用分割模型提取（不走 SegFormer）。
         """
         h, w = image.shape[:2]
 
@@ -859,25 +928,38 @@ class BlindPathNavigator:
 
             id2label = getattr(model.config, "id2label", {})
             free_space_ids = []
-            keywords = [
-                "road", "sidewalk", "floor", "ground", "path",
-                "runway", "track", "field", "plaza", "walk", "way"
-            ]
             for class_id, name in id2label.items():
-                name_l = str(name).lower()
-                if any(kw in name_l for kw in keywords):
+                # 扩展可通行区域：sidewalk + 各类地面/地板
+                name_l = str(name).lower().replace("_", " ").replace("-", " ").strip()
+                if name_l in (
+                    "sidewalk",
+                    "floor",
+                    "ground",
+                    "road",
+                    "roadway",
+                    "pavement",
+                    "path",
+                ):
                     free_space_ids.append(int(class_id))
 
             if not free_space_ids:
-                logger.warning("[BlindPath] SegFormer id2label 中未找到 free-space 相关类别，返回全黑 mask")
+                logger.warning("[BlindPath] SegFormer id2label 中未找到可通行类别（sidewalk/floor/ground/road...），返回全黑 mask")
                 blind_path_mask = np.zeros((h, w), dtype=np.uint8)
             else:
                 mask_bool = np.isin(pred, np.array(free_space_ids, dtype=np.int32))
                 raw_mask = (mask_bool.astype(np.uint8) * 255)
                 blind_path_mask = self._postprocess_walkable_mask(raw_mask)
 
-            # 目前暂不从 SegFormer 中单独提取斑马线，先返回 None
-            crosswalk_mask = None
+            # 斑马线模型拆分：以固定时间间隔（默认 1fps）运行，其余时间复用上一帧结果
+            crosswalk_mask: Optional[np.ndarray] = None
+            now_ts = time.time()
+            if self.crosswalk_seg_model is not None:
+                if (now_ts - self.last_crosswalk_detect_ts) >= self.crosswalk_interval_nav_sec:
+                    crosswalk_mask = self._detect_crosswalk_with_dedicated_model(image, h, w)
+                    self.last_crosswalk_mask = crosswalk_mask
+                    self.last_crosswalk_detect_ts = now_ts
+                else:
+                    crosswalk_mask = self.last_crosswalk_mask
 
             return blind_path_mask, crosswalk_mask
 
@@ -889,6 +971,119 @@ class BlindPathNavigator:
             strip_left = (w - strip_width) // 2
             blind_path_mask[int(h * 0.3):, strip_left:strip_left + strip_width] = 255
             return blind_path_mask, None
+
+    def _detect_crosswalk_with_dedicated_model(
+        self,
+        image: np.ndarray,
+        h: int,
+        w: int,
+    ) -> Optional[np.ndarray]:
+        """使用专用斑马线模型提取 crosswalk mask（不依赖 SegFormer）。"""
+        model = self.crosswalk_seg_model
+        if model is None:
+            return None
+
+        cw_id = int(os.getenv("AIGLASS_SEG_CW_ID", "0"))
+        conf_thr = float(self.CLASS_CONF_THRESHOLDS.get(0, 0.30))
+        min_area_ratio = float(os.getenv("AIGLASS_CROSSWALK_MIN_AREA_RATIO", "0.005"))
+        cw_name_set = {
+            "crosswalk",
+            "zebra",
+            "zebra crossing",
+            "zebra_crossing",
+            "road crossing",
+            "road_crossing",
+        }
+
+        detections = []
+        try:
+            if hasattr(model, "detect"):
+                # 兼容 workflow_crossstreet 的 detect 接口
+                detections = model.detect(image, confidence_threshold=conf_thr) or []
+            elif hasattr(model, "predict"):
+                # 兼容原生 ultralytics YOLO
+                results = model.predict(image, conf=conf_thr, verbose=False) or []
+                if results and len(results) > 0:
+                    result = results[0]
+                    if (
+                        hasattr(result, "masks")
+                        and result.masks is not None
+                        and hasattr(result, "boxes")
+                        and result.boxes is not None
+                    ):
+                        names_map = getattr(result, "names", {})
+                        for i, mask_tensor in enumerate(result.masks.data):
+                            class_id = int(result.boxes.cls[i].item())
+                            conf = float(result.boxes.conf[i].item())
+                            class_name = ""
+                            if isinstance(names_map, dict):
+                                class_name = str(names_map.get(class_id, ""))
+                            elif isinstance(names_map, list) and 0 <= class_id < len(names_map):
+                                class_name = str(names_map[class_id])
+                            detections.append(
+                                {
+                                    "mask": mask_tensor,
+                                    "cls": class_id,
+                                    "conf": conf,
+                                    "name": class_name,
+                                }
+                            )
+        except Exception as e:
+            logger.warning(f"[BlindPath] 斑马线模型推理失败: {e}")
+            return None
+
+        if not detections:
+            return None
+
+        cw_masks: List[np.ndarray] = []
+        for det in detections:
+            try:
+                if isinstance(det, dict):
+                    cls_id = int(det.get("cls", -1))
+                    score = float(det.get("conf", 0.0))
+                    name = str(det.get("name", "")).lower().replace("_", " ").strip()
+                    mask_raw = det.get("mask")
+                else:
+                    cls_id = int(getattr(det, "cls", -1))
+                    score = float(getattr(det, "conf", getattr(det, "confidence", 0.0)))
+                    name = str(getattr(det, "name", "")).lower().replace("_", " ").strip()
+                    mask_raw = getattr(det, "mask", None)
+            except Exception:
+                continue
+
+            if score < conf_thr:
+                continue
+            if not (cls_id == cw_id or name in cw_name_set):
+                continue
+            if mask_raw is None:
+                continue
+
+            if hasattr(mask_raw, "cpu"):
+                mask_arr = mask_raw.detach().cpu().numpy()
+            else:
+                mask_arr = np.asarray(mask_raw)
+            if mask_arr.ndim > 2:
+                mask_arr = np.squeeze(mask_arr)
+            if mask_arr.shape != (h, w):
+                mask_arr = cv2.resize(mask_arr, (w, h), interpolation=cv2.INTER_NEAREST)
+            if np.issubdtype(mask_arr.dtype, np.floating):
+                mask_bin = (mask_arr > 0.5).astype(np.uint8) * 255
+            else:
+                mask_bin = (mask_arr > 0).astype(np.uint8) * 255
+            cw_masks.append(mask_bin)
+
+        if not cw_masks:
+            return None
+
+        crosswalk_mask = np.maximum.reduce(cw_masks).astype(np.uint8)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        crosswalk_mask = cv2.morphologyEx(crosswalk_mask, cv2.MORPH_OPEN, k, iterations=1)
+        crosswalk_mask = cv2.morphologyEx(crosswalk_mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+        area_ratio = float(np.sum(crosswalk_mask > 0)) / float(h * w)
+        if area_ratio < min_area_ratio:
+            return None
+        return crosswalk_mask
     
     def _postprocess_walkable_mask(self, raw_mask: np.ndarray) -> np.ndarray:
         """
@@ -917,9 +1112,13 @@ class BlindPathNavigator:
                 self.walkable_ema = (1.0 - alpha) * self.walkable_ema + alpha * obs
             smooth_mask = (self.walkable_ema >= 0.5).astype(np.uint8) * 255
 
-            # 2) 3x3 开运算（erode + dilate）
-            kernel = np.ones((3, 3), dtype=np.uint8)
-            opened = cv2.morphologyEx(smooth_mask, cv2.MORPH_OPEN, kernel)
+            # 2) 形态学平滑：先闭后开，补小洞并清孤岛
+            k = max(3, int(round(min(h, w) * 0.008)))
+            if k % 2 == 0:
+                k += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            morph = cv2.morphologyEx(smooth_mask, cv2.MORPH_CLOSE, kernel)
+            opened = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
 
             # 3) 保留最大连通分量（4 邻域）
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=4)
@@ -938,6 +1137,8 @@ class BlindPathNavigator:
 
             best_idx = 1 + int(np.argmax(areas))
             walkable = np.where(labels == best_idx, 255, 0).astype(np.uint8)
+            walkable = self._fill_mask_holes(walkable)
+            walkable = self._regularize_walkable_mask_geometry(walkable)
 
             # 4) 质量统计（面积 / 宽度 / 形状），用于决定是否更新走廊 EMA，但不过度“砍掉”可视化
             total = h * w
@@ -977,8 +1178,9 @@ class BlindPathNavigator:
                     w_list.append(width)
 
             if not w_list:
-                # 底部带没有足够点时，不更新走廊，直接返回当前 walkable
-                return walkable
+                # 底部带没有足够点时，不更新走廊
+                voted = self._temporal_vote_walkable(walkable)
+                return self._guard_walkable_jump(voted)
 
             cx_med = float(np.median(cx_list))
             width_med = float(np.median(w_list))
@@ -996,14 +1198,185 @@ class BlindPathNavigator:
                     self.corridor_right_ema = float(right_pix)
                 else:
                     a = self.CORRIDOR_EMA_ALPHA
-                    self.corridor_left_ema = (1.0 - a) * self.corridor_left_ema + a * float(left_pix)
-                    self.corridor_right_ema = (1.0 - a) * self.corridor_right_ema + a * float(right_pix)
+                    max_delta = self.CORRIDOR_MAX_DELTA_RATIO * float(w)
+                    left_obs = float(np.clip(
+                        float(left_pix),
+                        self.corridor_left_ema - max_delta,
+                        self.corridor_left_ema + max_delta
+                    ))
+                    right_obs = float(np.clip(
+                        float(right_pix),
+                        self.corridor_right_ema - max_delta,
+                        self.corridor_right_ema + max_delta
+                    ))
+                    self.corridor_left_ema = (1.0 - a) * self.corridor_left_ema + a * left_obs
+                    self.corridor_right_ema = (1.0 - a) * self.corridor_right_ema + a * right_obs
 
-            # 返回贴近原始的 walkable 掩码（绿色区域），走廊矩形只用于后续计算/可视化叠加
-            return walkable
+            # 6) 多帧投票 + 异常跳变保护（工业相机抖动/重连时常见）
+            voted = self._temporal_vote_walkable(walkable)
+            stable = self._guard_walkable_jump(voted)
+            return stable
         except Exception as e:
             logger.warning(f"[BlindPath] 可通行区域后处理失败，回退原始mask: {e}")
             return raw_mask
+
+    def _fill_mask_holes(self, mask: np.ndarray) -> np.ndarray:
+        """填充前景内部小孔洞，减少边界破碎。"""
+        if mask is None:
+            return mask
+        m = (mask > 0).astype(np.uint8) * 255
+        h, w = m.shape[:2]
+        inv = cv2.bitwise_not(m)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=8)
+        if num_labels <= 1:
+            return m
+        holes = np.zeros_like(m)
+        for idx in range(1, num_labels):
+            x, y, bw, bh, area = stats[idx]
+            if area <= 0:
+                continue
+            touch_border = (x == 0) or (y == 0) or ((x + bw) >= w) or ((y + bh) >= h)
+            if not touch_border:
+                holes[labels == idx] = 255
+        return cv2.bitwise_or(m, holes)
+
+    def _regularize_walkable_mask_geometry(self, mask: np.ndarray) -> np.ndarray:
+        """
+        几何规则化：
+        在每行提取左右边界，做插值+平滑后重建连续走廊多边形，
+        让可通行区域形状更稳定、边界更规整。
+        """
+        if mask is None:
+            return mask
+        m = (mask > 0).astype(np.uint8) * 255
+        h, w = m.shape[:2]
+        y_start = int(h * 0.35)
+        ys = np.arange(y_start, h, dtype=np.int32)
+        if ys.size < 10:
+            return m
+
+        left = np.full((ys.size,), np.nan, dtype=np.float32)
+        right = np.full((ys.size,), np.nan, dtype=np.float32)
+        min_row_pixels = max(4, int(w * self.WALKABLE_MIN_ROW_COVERAGE_RATIO))
+        for i, y in enumerate(ys):
+            xs = np.where(m[y, :] > 0)[0]
+            if xs.size >= min_row_pixels:
+                ql = int(0.08 * (xs.size - 1))
+                qr = int(0.92 * (xs.size - 1))
+                left[i] = float(xs[ql])
+                right[i] = float(xs[qr])
+
+        valid = ~np.isnan(left) & ~np.isnan(right)
+        min_valid_rows = max(8, int(self.WALKABLE_MIN_VALID_ROWS_RATIO * ys.size))
+        if int(np.sum(valid)) < min_valid_rows:
+            return m
+
+        idx = np.arange(ys.size, dtype=np.float32)
+        left_i = np.interp(idx, idx[valid], left[valid]).astype(np.float32)
+        right_i = np.interp(idx, idx[valid], right[valid]).astype(np.float32)
+
+        win = max(5, int(self.WALKABLE_ROW_SMOOTH_WIN))
+        if win % 2 == 0:
+            win += 1
+        kernel = np.ones((win,), dtype=np.float32) / float(win)
+        left_s = np.convolve(left_i, kernel, mode="same")
+        right_s = np.convolve(right_i, kernel, mode="same")
+
+        min_width = max(8, int(self.WALKABLE_MIN_WIDTH_RATIO * w * 0.8))
+        center = 0.5 * (left_s + right_s)
+        half = np.maximum(min_width / 2.0, 0.5 * (right_s - left_s))
+        left_s = np.clip(center - half, 0, w - 1).astype(np.int32)
+        right_s = np.clip(center + half, 0, w - 1).astype(np.int32)
+
+        poly_left = np.stack([left_s, ys], axis=1)
+        poly_right = np.stack([right_s[::-1], ys[::-1]], axis=1)
+        poly = np.concatenate([poly_left, poly_right], axis=0).astype(np.int32)
+
+        regular = np.zeros_like(m)
+        cv2.fillPoly(regular, [poly], 255)
+
+        # 仅允许在原始区域附近扩展，避免规则化过度扩张
+        grow_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        m_dilate = cv2.dilate(m, grow_k, iterations=1)
+        regular = cv2.bitwise_and(regular, m_dilate)
+        return regular
+
+    def _temporal_vote_walkable(self, mask: np.ndarray) -> np.ndarray:
+        """短窗口多数投票，抑制单帧抖动。"""
+        if mask is None:
+            return mask
+        m = (mask > 0).astype(np.uint8) * 255
+        h, w = m.shape[:2]
+        if self.walkable_prev_shape != (h, w):
+            self.walkable_binary_history.clear()
+            self.walkable_prev_shape = (h, w)
+        self.walkable_binary_history.append((m > 0).astype(np.uint8))
+        n = len(self.walkable_binary_history)
+        if n <= 1:
+            return m
+        vote_thr = max(2, int(np.ceil(n * 0.6)))
+        acc = np.zeros((h, w), dtype=np.uint16)
+        for item in self.walkable_binary_history:
+            acc += item.astype(np.uint16)
+        return (acc >= vote_thr).astype(np.uint8) * 255
+
+    def _mask_iou(self, a: np.ndarray, b: np.ndarray) -> float:
+        aa = a > 0
+        bb = b > 0
+        inter = np.logical_and(aa, bb).sum()
+        union = np.logical_or(aa, bb).sum()
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def _mask_centroid_and_ratio(self, mask: np.ndarray) -> Tuple[Optional[float], float]:
+        m = (mask > 0)
+        area = int(np.sum(m))
+        if area <= 0:
+            return None, 0.0
+        ys, xs = np.where(m)
+        cx = float(np.mean(xs))
+        ratio = float(area) / float(mask.shape[0] * mask.shape[1])
+        return cx, ratio
+
+    def _guard_walkable_jump(self, mask: np.ndarray) -> np.ndarray:
+        """
+        帧间异常跳变保护：
+        低IoU + 大中心偏移 + 大面积变化时，短暂保持上一稳定结果。
+        """
+        if mask is None:
+            return mask
+        m = (mask > 0).astype(np.uint8) * 255
+        if self.walkable_prev_final is None or self.walkable_prev_final.shape != m.shape:
+            self.walkable_prev_final = m.copy()
+            self.walkable_glitch_count = 0
+            return m
+
+        prev = self.walkable_prev_final
+        iou = self._mask_iou(prev, m)
+        cx_prev, ar_prev = self._mask_centroid_and_ratio(prev)
+        cx_curr, ar_curr = self._mask_centroid_and_ratio(m)
+        w = float(m.shape[1])
+        center_jump = 0.0
+        if cx_prev is not None and cx_curr is not None and w > 1.0:
+            center_jump = abs(cx_curr - cx_prev) / w
+        area_jump = abs(ar_curr - ar_prev)
+
+        is_glitch = (
+            iou < self.WALKABLE_JUMP_IOU_THR and
+            center_jump > self.WALKABLE_JUMP_CENTER_THR and
+            area_jump > self.WALKABLE_JUMP_AREA_THR
+        )
+        if is_glitch and self.walkable_glitch_count < self.WALKABLE_GLITCH_HOLD_FRAMES:
+            self.walkable_glitch_count += 1
+            logger.info(
+                f"[BlindPath] 检测到mask跳变，使用上一稳定帧: iou={iou:.3f}, "
+                f"center_jump={center_jump:.3f}, area_jump={area_jump:.3f}, "
+                f"hold={self.walkable_glitch_count}/{self.WALKABLE_GLITCH_HOLD_FRAMES}"
+            )
+            return prev.copy()
+
+        self.walkable_glitch_count = 0
+        self.walkable_prev_final = m.copy()
+        return m
 
     def _tensor_to_mask(self, mask_tensor, out_w: int, out_h: int, binarize: bool = True) -> np.ndarray:
         """将张量掩码转换为numpy数组"""
@@ -1676,9 +2049,9 @@ class BlindPathNavigator:
             self.last_obstacle_speech = ""
             self.pending_obstacle_voice = None
         
-        # 优先级2：常规导航（左移/右移/左转/右转 > 直行）
+        # 优先级2：常规导航（脚前带裕度 + 左移/右移/左转/右转 > 直行）
         return self._generate_navigation_guidance(
-            features, image_height, image_width, frame_visualizations
+            features, image_height, image_width, frame_visualizations, mask=mask
         )
     
     def _handle_maneuvering_turn(self, mask, image, frame_visualizations,
@@ -1963,25 +2336,34 @@ class BlindPathNavigator:
             # 脚前一段（60%~95% 高度）的左右边界与边距，用于「仅靠近边界时提醒」
             margin_left = margin_right = path_center_x_norm = None
             try:
-                data_arr = np.array(centerline_data)
-                y_min, y_max = height * 0.60, height * 0.95
-                band = data_arr[(data_arr[:, 0] >= y_min) & (data_arr[:, 0] <= y_max)]
-                if band.size > 0:
-                    cx = band[:, 1]
-                    w_band = band[:, 2]
-                    left_edges = cx - w_band / 2.0
-                    right_edges = cx + w_band / 2.0
-                    left_bound = float(np.median(left_edges))
-                    right_bound = float(np.median(right_edges))
-                    half_w = width / 2.0
-                    # 当前视角中心（人）到左/右边界的距离，归一化到半宽；小=靠近该侧边界
+                half_w = width / 2.0
+                # 优先使用后处理阶段稳定下来的走廊边界
+                if self.corridor_left_ema is not None and self.corridor_right_ema is not None:
+                    left_bound = float(self.corridor_left_ema)
+                    right_bound = float(self.corridor_right_ema)
                     margin_left = float(np.clip((half_w - left_bound) / half_w, 0.0, 2.0))
                     margin_right = float(np.clip((right_bound - half_w) / half_w, 0.0, 2.0))
-                    if np.sum(w_band) > 1e-3:
-                        cx_mean = float(np.sum(cx * w_band) / np.sum(w_band))
-                    else:
-                        cx_mean = float(np.mean(cx))
+                    cx_mean = 0.5 * (left_bound + right_bound)
                     path_center_x_norm = float(np.clip((cx_mean - half_w) / half_w, -1.0, 1.0))
+                else:
+                    data_arr = np.array(centerline_data)
+                    y_min, y_max = height * 0.60, height * 0.95
+                    band = data_arr[(data_arr[:, 0] >= y_min) & (data_arr[:, 0] <= y_max)]
+                    if band.size > 0:
+                        cx = band[:, 1]
+                        w_band = band[:, 2]
+                        left_edges = cx - w_band / 2.0
+                        right_edges = cx + w_band / 2.0
+                        left_bound = float(np.median(left_edges))
+                        right_bound = float(np.median(right_edges))
+                        # 当前视角中心（人）到左/右边界的距离，归一化到半宽；小=靠近该侧边界
+                        margin_left = float(np.clip((half_w - left_bound) / half_w, 0.0, 2.0))
+                        margin_right = float(np.clip((right_bound - half_w) / half_w, 0.0, 2.0))
+                        if np.sum(w_band) > 1e-3:
+                            cx_mean = float(np.sum(cx * w_band) / np.sum(w_band))
+                        else:
+                            cx_mean = float(np.mean(cx))
+                        path_center_x_norm = float(np.clip((cx_mean - half_w) / half_w, -1.0, 1.0))
             except Exception:
                 pass
             
@@ -2307,70 +2689,224 @@ class BlindPathNavigator:
         ]
         return plan
     
-    def _generate_navigation_guidance(self, features, image_height, image_width, frame_visualizations):
+    def _generate_navigation_guidance(self, features, image_height, image_width, frame_visualizations, mask=None):
         """
-        可通行区域「边界安全」指引：只在你快走出人行道时提醒，不跟中心线。
-        大致方向、转弯由高德/谷歌导航控制；这里只负责：别走到马路上。
+        可通行区域「边界安全」指引：脚前带裕度（像素）+ 滞回 + 冷却。
+        有 mask 时用脚前带算 left/right 裕度与是否在路上；无 mask 时回退到 centerline 或旧边距。
         """
-        image_center_x = image_width / 2
+        h, w = image_height, image_width
+        cx = w / 2.0
+        heading_rad = float(features.get("tangent_angle_rad", 0.0))
+        heading_deg = float(np.degrees(heading_rad))
         path_center_x_norm = features.get("pathCenterXNorm")
+
+        # ----- 有 mask：脚前带逻辑（主路径） -----
+        if mask is not None:
+            mask_2d = np.asarray(mask)
+            if mask_2d.ndim == 3:
+                mask_2d = (mask_2d.max(axis=2) > 0).astype(np.uint8)
+            y_lo = int(h * self.foot_band_y_lo)
+            y_hi = int(h * self.foot_band_y_hi)
+            y_lo = max(0, min(y_lo, h - 1))
+            y_hi = max(y_lo + 1, min(y_hi, h))
+
+            # 画面中心线（调试可视化）：固定在屏幕中心 x=cx 的红色实线
+            # 注意：_parse_color() 不支持 "white" 这种颜色名，之前会回退成红色导致误解为“会移动的红线”
+            center_x_int = int(cx)
+            frame_visualizations.append({
+                "type": "line",
+                "start": [center_x_int, int(y_lo)],
+                "end": [center_x_int, int(y_hi)],
+                "color": "rgba(255, 0, 0, 0.9)",
+                "thickness": 2
+            })
+
+            lefts, rights = [], []
+            on_path_pixels = 0
+            sampled_rows = 0
+            step = max(1, (y_hi - y_lo) // 20)
+            for y in range(y_lo, y_hi, step):
+                row = mask_2d[y, :]
+                if row.dtype != np.uint8 and row.max() > 1:
+                    row = (row > 0).astype(np.uint8)
+                x_where = np.where(row.flatten() > 0)[0]
+                sampled_rows += 1
+                if len(x_where) > 0:
+                    lefts.append(int(x_where[0]))
+                    rights.append(int(x_where[-1]))
+                    on_path_pixels += int(np.sum(row > 0))
+            # 注意：这里是按抽样行统计的像素数，所以分母也应使用抽样行面积，避免系统性低估占比
+            denom = sampled_rows * w
+            on_path_ratio = (on_path_pixels / denom) if denom > 0 else 0.0
+
+            # 前方无路：优先提示
+            if on_path_ratio < self.on_path_min_ratio:
+                self.boundary_warn_state = "none"
+                self.boundary_warn_consecutive_count = 0
+                self.boundary_warn_consecutive_side = None
+                features["guidance_code"] = "stop_no_path"
+                self._add_data_panel(frame_visualizations, {
+                    "状态": "脚前带",
+                    "引导": "请停下，前方无路",
+                    "路上占比": f"{on_path_ratio:.2f}",
+                    "左/右px": "—",
+                }, (25, image_height - 75))
+                return "请停下，前方无路"
+
+            if lefts and rights:
+                left_bound = float(np.median(lefts))
+                right_bound = float(np.median(rights))
+                margin_left_px = cx - left_bound
+                margin_right_px = right_bound - cx
+            else:
+                margin_left_px = margin_right_px = 999.0
+                left_bound = right_bound = cx
+
+            self.boundary_margin_history.append((margin_left_px, margin_right_px))
+            if len(self.boundary_margin_history) >= 5:
+                ml_px = float(np.median([x[0] for x in list(self.boundary_margin_history)[-5:]]))
+                mr_px = float(np.median([x[1] for x in list(self.boundary_margin_history)[-5:]]))
+            else:
+                ml_px, mr_px = margin_left_px, margin_right_px
+
+            now_t = time.time()
+            candidate = "none"
+            if mr_px < self.warn_px:
+                candidate = "warn_right"
+            elif ml_px < self.warn_px:
+                candidate = "warn_left"
+
+            # 退出滞回：两侧都大于 exit_px 则清零
+            if ml_px >= self.boundary_exit_px and mr_px >= self.boundary_exit_px:
+                self.boundary_warn_consecutive_side = None
+                self.boundary_warn_consecutive_count = 0
+                if self.boundary_warn_state != "none":
+                    self.boundary_warn_state = "none"
+
+            if candidate != "none":
+                if candidate == self.boundary_warn_consecutive_side:
+                    self.boundary_warn_consecutive_count += 1
+                else:
+                    self.boundary_warn_consecutive_side = candidate
+                    self.boundary_warn_consecutive_count = 1
+                if (self.boundary_warn_consecutive_count >= self.boundary_consecutive_required and
+                        (now_t - self.last_boundary_warn_time) >= self.boundary_cooldown_sec):
+                    self.boundary_warn_state = candidate
+                    self.last_boundary_warn_time = now_t
+            else:
+                self.boundary_warn_consecutive_side = None
+                self.boundary_warn_consecutive_count = 0
+
+            # 姿态角滞回（与原先一致）
+            self.heading_error_history.append(heading_deg)
+            heading_f = float(np.median(self.heading_error_history)) if len(self.heading_error_history) >= 5 else heading_deg
+            heading_state = self.heading_warn_state
+            if heading_state == "turn_left" and heading_f <= self.heading_exit_deg:
+                heading_state = "none"
+            elif heading_state == "turn_right" and heading_f >= -self.heading_exit_deg:
+                heading_state = "none"
+            if heading_state == "none":
+                if heading_f >= self.heading_enter_deg:
+                    heading_state = "turn_left"
+                elif heading_f <= -self.heading_enter_deg:
+                    heading_state = "turn_right"
+            self.heading_warn_state = heading_state
+
+            # 优先级：边界 > 方向微调 > 脚前带居中微调 > 直行
+            if self.boundary_warn_state == "warn_right":
+                raw_code = "move_left"
+            elif self.boundary_warn_state == "warn_left":
+                raw_code = "move_right"
+            elif heading_state == "turn_left":
+                raw_code = "turn_left"
+            elif heading_state == "turn_right":
+                raw_code = "turn_right"
+            else:
+                path_center_foot = (left_bound + right_bound) / 2.0
+                offset_px = cx - path_center_foot
+                if abs(offset_px) > self.center_offset_px_thr:
+                    raw_code = "move_left" if offset_px > 0 else "move_right"
+                else:
+                    raw_code = "keep_straight"
+
+            self.nav_command_history.append(raw_code)
+            guidance_code = raw_code
+            if len(self.nav_command_history) >= self.nav_command_stable_count:
+                counts = {}
+                for c in self.nav_command_history:
+                    counts[c] = counts.get(c, 0) + 1
+                top_code, top_n = max(counts.items(), key=lambda kv: kv[1])
+                if top_n >= self.nav_command_stable_count:
+                    guidance_code = top_code
+
+            if guidance_code == "move_left":
+                guidance_text = "向左移动一点" if self.boundary_warn_state in ("warn_right",) else "稍微向左靠一点"
+            elif guidance_code == "move_right":
+                guidance_text = "向右移动一点" if self.boundary_warn_state in ("warn_left",) else "稍微向右靠一点"
+            elif guidance_code == "turn_left":
+                guidance_text = "请向左微调方向"
+            elif guidance_code == "turn_right":
+                guidance_text = "请向右微调方向"
+            elif guidance_code == "keep_straight":
+                guidance_text = "保持直行"
+            else:
+                guidance_text = ""
+
+            features["guidance_code"] = guidance_code
+            self._add_data_panel(frame_visualizations, {
+                "状态": "脚前带（边界安全）",
+                "引导": guidance_text or "—",
+                "左px": f"{ml_px:.0f}",
+                "右px": f"{mr_px:.0f}",
+                "路上": f"{on_path_ratio:.2f}",
+            }, (25, image_height - 75))
+
+            # 中心线可视化（调试用）
+            # - 黄色：poly_func 拟合出的“路径中心曲线”
+            if features.get("poly_func") is not None:
+                poly_func = features["poly_func"]
+                plot_y = np.arange(int(h * 0.3), h, 5).astype(int)
+                plot_x = poly_func(plot_y).astype(int)
+                pts = np.vstack((plot_x, plot_y)).T.tolist()
+                frame_visualizations.append({"type": "polyline", "points": pts, "color": "yellow", "width": 2})
+            return guidance_text
+
+        # ----- 无 mask：回退到 centerline / 旧边距（归一化） -----
+        image_center_x = cx
         margin_left = features.get("margin_left")
         margin_right = features.get("margin_right")
         centerline_data = features.get("centerline_data")
-
-        # 若无边界边距，用 centerline_data 在脚前带算一遍
         if margin_left is None or margin_right is None:
             if centerline_data is not None and len(centerline_data) > 0:
                 try:
                     data_arr = np.array(centerline_data)
-                    h, w = image_height, image_width
                     y_min, y_max = h * 0.60, h * 0.95
                     band = data_arr[(data_arr[:, 0] >= y_min) & (data_arr[:, 0] <= y_max)]
                     if band.size > 0:
-                        cx, ww = band[:, 1], band[:, 2]
-                        left_bound = float(np.median(cx - ww / 2.0))
-                        right_bound = float(np.median(cx + ww / 2.0))
+                        cx_b, ww = band[:, 1], band[:, 2]
+                        lb = float(np.median(cx_b - ww / 2.0))
+                        rb = float(np.median(cx_b + ww / 2.0))
                         half_w = w / 2.0
-                        margin_left = float(np.clip((half_w - left_bound) / half_w, 0.0, 2.0))
-                        margin_right = float(np.clip((right_bound - half_w) / half_w, 0.0, 2.0))
+                        margin_left = float(np.clip((half_w - lb) / half_w, 0.0, 2.0))
+                        margin_right = float(np.clip((rb - half_w) / half_w, 0.0, 2.0))
                 except Exception:
                     pass
         if margin_left is None:
             margin_left = 1.0
         if margin_right is None:
             margin_right = 1.0
-
-        # 时间平滑
         self.boundary_margin_history.append((margin_left, margin_right))
-        if len(self.boundary_margin_history) >= 5:
-            ml = np.median([x[0] for x in self.boundary_margin_history])
-            mr = np.median([x[1] for x in self.boundary_margin_history])
-        else:
-            ml, mr = margin_left, margin_right
+        ml = np.median([x[0] for x in list(self.boundary_margin_history)[-5:]]) if len(self.boundary_margin_history) >= 5 else margin_left
+        mr = np.median([x[1] for x in list(self.boundary_margin_history)[-5:]]) if len(self.boundary_margin_history) >= 5 else margin_right
+        self.heading_error_history.append(heading_deg)
+        heading_f = float(np.median(self.heading_error_history)) if len(self.heading_error_history) >= 5 else heading_deg
 
-        # 中心线可视化（调试用）
-        if path_center_x_norm is not None:
-            target_x = image_center_x + float(path_center_x_norm) * image_center_x
-            plot_y = np.arange(int(image_height * 0.5), image_height, 5).astype(int)
-            plot_x = np.full_like(plot_y, int(target_x))
-            pts = np.vstack((plot_x, plot_y)).T.tolist()
-            frame_visualizations.append({"type": "polyline", "points": pts, "color": "cyan", "width": 2})
-        elif features.get("poly_func") is not None:
-            poly_func = features["poly_func"]
-            plot_y = np.arange(int(image_height * 0.3), image_height, 5).astype(int)
-            plot_x = poly_func(plot_y).astype(int)
-            pts = np.vstack((plot_x, plot_y)).T.tolist()
-            frame_visualizations.append({"type": "polyline", "points": pts, "color": "yellow", "width": 2})
-
-        # 边界滞回：仅靠近一侧边界时才提醒，退出要更宽松
         now_t = time.time()
         new_state = self.boundary_warn_state
-        # 先处理退出：当前在提醒某一侧时，该侧边距变大则取消
         if self.boundary_warn_state == "warn_right" and mr >= self.boundary_exit:
             new_state = "none"
         elif self.boundary_warn_state == "warn_left" and ml >= self.boundary_exit:
             new_state = "none"
-        # 再处理进入：靠近哪一侧就提醒哪一侧；两侧都靠近时选边距更小的一侧
         if new_state == "none" or new_state == self.boundary_warn_state:
             if mr < self.boundary_enter and ml < self.boundary_enter:
                 new_state = "warn_right" if mr <= ml else "warn_left"
@@ -2378,11 +2914,8 @@ class BlindPathNavigator:
                 new_state = "warn_right"
             elif ml < self.boundary_enter:
                 new_state = "warn_left"
-
-        # 切换侧别时加时间间隔，避免左右来回念
         if new_state != self.boundary_warn_state:
-            if (new_state == "none" or
-                (now_t - self.last_boundary_warn_time) >= self.boundary_change_interval):
+            if new_state == "none" or (now_t - self.last_boundary_warn_time) >= self.boundary_change_interval:
                 self.boundary_warn_state = new_state
                 if new_state != "none":
                     self.last_boundary_warn_time = now_t
@@ -2391,23 +2924,56 @@ class BlindPathNavigator:
         else:
             self.boundary_warn_state = new_state
 
-        if new_state == "warn_right":
-            guidance_text = "向左移动"
-            guidance_code = "move_left"
-        elif new_state == "warn_left":
-            guidance_text = "向右移动"
-            guidance_code = "move_right"
-        else:
-            # 边界安全状态下，无需左右移动时定期给出「保持直行」
-            guidance_text = "保持直行"
-            guidance_code = "straight"
+        heading_state = self.heading_warn_state
+        if heading_state == "turn_left" and heading_f <= self.heading_exit_deg:
+            heading_state = "none"
+        elif heading_state == "turn_right" and heading_f >= -self.heading_exit_deg:
+            heading_state = "none"
+        if heading_state == "none":
+            if heading_f >= self.heading_enter_deg:
+                heading_state = "turn_left"
+            elif heading_f <= -self.heading_enter_deg:
+                heading_state = "turn_right"
+        self.heading_warn_state = heading_state
 
+        if new_state == "warn_right":
+            raw_code = "move_left"
+        elif new_state == "warn_left":
+            raw_code = "move_right"
+        elif heading_state == "turn_left":
+            raw_code = "turn_left"
+        elif heading_state == "turn_right":
+            raw_code = "turn_right"
+        else:
+            raw_code = "keep_straight"
+        self.nav_command_history.append(raw_code)
+        guidance_code = raw_code
+        if len(self.nav_command_history) >= self.nav_command_stable_count:
+            counts = {}
+            for c in self.nav_command_history:
+                counts[c] = counts.get(c, 0) + 1
+            top_code, top_n = max(counts.items(), key=lambda kv: kv[1])
+            if top_n >= self.nav_command_stable_count:
+                guidance_code = top_code
+        if guidance_code == "move_left":
+            guidance_text = "向左移动一点"
+        elif guidance_code == "move_right":
+            guidance_text = "向右移动一点"
+        elif guidance_code == "turn_left":
+            guidance_text = "请向左微调方向"
+        elif guidance_code == "turn_right":
+            guidance_text = "请向右微调方向"
+        elif guidance_code == "keep_straight":
+            guidance_text = "保持直行"
+        else:
+            guidance_text = ""
         features["guidance_code"] = guidance_code
         self._add_data_panel(frame_visualizations, {
             "状态": "可通行区域（边界安全）",
             "引导": guidance_text or "—",
             "边距左": f"{ml:.2f}",
             "边距右": f"{mr:.2f}",
+            "偏航角": f"{heading_f:.1f}°",
         }, (25, image_height - 75))
         return guidance_text
     
@@ -3378,6 +3944,11 @@ class BlindPathNavigator:
         self.lock_on_data = None
         self.boundary_warn_state = "none"
         self.boundary_margin_history.clear()
+        self.boundary_warn_consecutive_count = 0
+        self.boundary_warn_consecutive_side = None
+        self.heading_warn_state = "none"
+        self.heading_error_history.clear()
+        self.nav_command_history.clear()
         
         # 重置光流和平滑相关
         self.flow_points = {}
@@ -3385,6 +3956,14 @@ class BlindPathNavigator:
         self.centerline_history = []
         self.blind_miss_ttl = 0
         self.cross_miss_ttl = 0
+        self.walkable_ema = None
+        self.walkable_ema_shape = None
+        self.walkable_binary_history.clear()
+        self.walkable_prev_final = None
+        self.walkable_prev_shape = None
+        self.walkable_glitch_count = 0
+        self.corridor_left_ema = None
+        self.corridor_right_ema = None
         
         # 重置语音相关
         self.pending_obstacle_voice = None

@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_camera.h>
+#include "esp_sleep.h"
 #include <ArduinoWebsockets.h>
 #include "ESP_I2S.h"
 #include "freertos/FreeRTOS.h"
@@ -14,6 +15,9 @@ struct WavFmt;
 #include <WiFiClient.h> 
 #include <SPI.h>        // <<< 改成 SPI
 using namespace websockets;
+
+// ===== 硬件变体选择（0=原开发板, 1=OMI Glass） =====
+#define HW_VARIANT_OMI_GLASS 1
 
 // ===== WiFi / Server =====
 // 改为你的手机热点与 MacBook 在热点下的 IP（手机开热点，Mac 和 ESP32 都连上）
@@ -33,9 +37,9 @@ static const char* AUD_WS_PATH = "/ws_audio";
 #include "camera_pins.h"
 
 framesize_t g_frame_size = FRAMESIZE_VGA;
-#define JPEG_QUALITY  17
+#define JPEG_QUALITY  26
 #define FB_COUNT      2
-volatile int g_target_fps = 0; // 新增：0=不限，>0 则按该FPS限速发送
+volatile int g_target_fps = 12; // 新增：0=不限，>0 则按该FPS限速发送
 
 // 【新增】视频传输性能监控
 volatile unsigned long frame_captured_count = 0;  // 采集帧计数
@@ -43,6 +47,8 @@ volatile unsigned long frame_sent_count = 0;      // 发送帧计数
 volatile unsigned long frame_dropped_count = 0;   // 丢弃帧计数
 volatile unsigned long last_stats_time = 0;       // 上次统计时间
 volatile unsigned long ws_send_fail_count = 0;    // WebSocket发送失败计数
+volatile unsigned long frame_meta_sent_count = 0; // 元信息发送计数
+volatile unsigned long frame_seq_id = 0;          // 帧序号（单调递增）
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
@@ -71,6 +77,29 @@ const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
 
+// ===== OMI 电池管理相关常量（仅在 OMI Glass 变体下启用） =====
+#if HW_VARIANT_OMI_GLASS
+// 设为 0 可关闭电池读取，用于排查：GPIO2/ADC 与 WiFi 同芯可能互相干扰，导致 FPS 偏低
+#define ENABLE_OMI_BATTERY_READ  0
+
+// 电池参数（从 OMI firmware 迁移）
+#define BATTERY_MAX_VOLTAGE       4.2f
+#define BATTERY_MIN_VOLTAGE       3.2f
+#define BATTERY_CRITICAL_VOLTAGE 3.3f
+#define BATTERY_LOW_VOLTAGE       3.4f
+#define VOLTAGE_DIVIDER_RATIO     6.086f
+
+#define BATTERY_TASK_INTERVAL_MS  20000UL  // 每 20 秒检测一次
+
+// OMI 硬件引脚：电池分压 ADC、状态灯、按键
+#define BATTERY_ADC_PIN  2   // GPIO2 (A1) - 电池电压分压输入
+#define STATUS_LED_PIN   21  // 状态指示灯（低电平亮）
+#define PTT_BUTTON_PIN   1   // OMI Glass 电源键，同时作为 PTT
+#else
+// 原开发板：仅使用 D1(GPIO2) 作为 PTT，不启用电池管理
+#define PTT_BUTTON_PIN   2
+#endif
+
 // ===== WS / Queues / I2S =====
 WebsocketsClient wsCam;
 WebsocketsClient wsAud;
@@ -79,6 +108,11 @@ volatile bool aud_ws_ready = false;
 volatile bool snapshot_in_progress = false; // 抓拍期间暂停实时采集
 
 typedef camera_fb_t* fb_ptr_t;
+typedef struct {
+  camera_fb_t* fb;
+  uint32_t frame_id;
+  uint32_t t_capture_ms;
+} CamFrameItem;
 QueueHandle_t qFrames;
 
 typedef struct {
@@ -92,15 +126,41 @@ typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
 volatile bool tts_playing = false;
 
+enum AudControlCmd {
+  AUD_CMD_NONE = 0,
+  AUD_CMD_START = 1,
+  AUD_CMD_STOP = 2,
+  AUD_CMD_RESTART = 3
+};
+volatile int g_pending_aud_cmd = AUD_CMD_NONE;
+
 I2SClass i2sIn;   // PDM RX (Mic)
 I2SClass i2sOut;  // STD TX (Speaker)
 volatile bool run_audio_stream = false;   // 由按键控制是否录音
 
-// 按键 PTT：按一下开始录音（发送 START），再按一下结束录音（发送 STOP）
-// 参考 darksight：使用 D1(GPIO2) 作为按键
-#define PTT_BUTTON_PIN 2
-bool ptt_last_level = true;     // INPUT_PULLUP, 未按下=HIGH
-bool ptt_recording = false;     // 当前是否处于录音中（START/STOP 切换）
+// 按键：短按 = 录音 START/STOP，长按 = 关机（深度睡眠）
+// - 在 OMI Glass 变体下：使用电源键 GPIO1
+// - 在原开发板变体下：使用 D1(GPIO2)
+bool ptt_last_level = true;      // 最近一次稳定电平（INPUT_PULLUP, 未按下=HIGH）
+bool ptt_recording = false;      // 当前是否处于录音中（START/STOP 切换）
+
+#if HW_VARIANT_OMI_GLASS
+// OMI Glass 关机 LED 状态机（对齐原固件）
+typedef enum {
+  LED_NORMAL_OPERATION,
+  LED_POWER_OFF_SEQUENCE
+} led_status_t;
+
+led_status_t ledMode = LED_NORMAL_OPERATION;
+unsigned long powerOffStartTime = 0;
+#endif
+
+// OMI 电池管理状态（仅在 OMI 变体下使用）
+#if HW_VARIANT_OMI_GLASS
+float batteryVoltage = 0.0f;
+int   batteryPercentage = 0;
+unsigned long lastBatteryCheck = 0;
+#endif
 
 // ====================================================================
 // Camera
@@ -141,13 +201,13 @@ bool init_camera() {
   if (s) {
 
     s->set_hmirror(s, 1);  // ★ 新增：水平镜像，与人眼左右一致（1=开，0=关）
-    s->set_vflip(s, 0);    // ★ 新增：垂直翻转；若镜头“倒装”，改为 1
+    s->set_vflip(s, 1);    // ★ 新增：垂直翻转；若镜头“倒装”，改为 1
 
-    s->set_brightness(s, 0);
+    s->set_brightness(s, 2);
     s->set_contrast(s, 1);
     s->set_saturation(s, 1);
     s->set_gain_ctrl(s, 1);
-    s->set_exposure_ctrl(s, 0);
+    s->set_exposure_ctrl(s, 1);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_aec2(s, 0);
@@ -156,18 +216,23 @@ bool init_camera() {
   return true;
 }
 
-inline void enqueue_frame(camera_fb_t* fb) {
+inline void enqueue_frame(camera_fb_t* fb, uint32_t frame_id, uint32_t t_capture_ms) {
   if (!fb) return;
-  if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
+  CamFrameItem item;
+  item.fb = fb;
+  item.frame_id = frame_id;
+  item.t_capture_ms = t_capture_ms;
+  if (xQueueSend(qFrames, &item, 0) != pdPASS) {
     // 队列满，丢弃最旧的帧
-    fb_ptr_t drop = nullptr;
+    CamFrameItem drop;
+    drop.fb = nullptr;
     if (xQueueReceive(qFrames, &drop, 0) == pdPASS) {
-      if (drop) {
-        esp_camera_fb_return(drop);
+      if (drop.fb) {
+        esp_camera_fb_return(drop.fb);
         frame_dropped_count++;  // 统计丢帧
       }
     }
-    xQueueSend(qFrames, &fb, 0);
+    xQueueSend(qFrames, &item, 0);
   }
 }
 
@@ -182,12 +247,14 @@ void taskCamCapture(void*) {
       camera_fb_t* fb = esp_camera_fb_get();
       if (fb) {
         frame_captured_count++;
+        uint32_t capture_ms = (uint32_t)millis();
+        uint32_t frame_id = (uint32_t)(++frame_seq_id);
         if (fb->format != PIXFORMAT_JPEG) { 
           esp_camera_fb_return(fb);
           capture_fail_count++;
         }
         else { 
-          enqueue_frame(fb);
+          enqueue_frame(fb, frame_id, capture_ms);
         }
       } else {
         capture_fail_count++;
@@ -214,10 +281,17 @@ void taskCamSend(void*) {
   unsigned long last_log = 0;
   unsigned long send_timeout_count = 0;
   unsigned long last_sent_time = 0;
+  int consecutive_send_fail = 0;
   
   for(;;){
-    fb_ptr_t fb = nullptr;
-    if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
+    CamFrameItem item;
+    item.fb = nullptr;
+    item.frame_id = 0;
+    item.t_capture_ms = 0;
+    // 已连接时短超时取帧，提高 FPS；兼顾 poll() 处理 ping/pong
+    const uint32_t recv_ticks = cam_ws_ready ? pdMS_TO_TICKS(15) : pdMS_TO_TICKS(100);
+    if (xQueueReceive(qFrames, &item, recv_ticks) == pdPASS) {
+      camera_fb_t* fb = item.fb;
       if (fb && cam_ws_ready) {
         // 发送节流：若设置了目标FPS，则按周期发，丢弃多余帧由 qFrames 机制承担
         if (g_target_fps > 0) {
@@ -230,39 +304,85 @@ void taskCamSend(void*) {
         
         unsigned long send_start = millis();
         bool ok = false;
-        const int WS_SEND_RETRY = 4;           // 发送失败时重试次数，避免瞬时拥塞就断连
-        const int WS_SEND_RETRY_DELAY_MS = 60;
-        for (int r = 0; r < WS_SEND_RETRY && !ok; r++) {
-          if (r > 0) delay(WS_SEND_RETRY_DELAY_MS);
-          ok = wsCam.sendBinary((const char*)fb->buf, fb->len);
+        bool timeout_abort = false;
+        // 小块发送：单次 sendBinary 阻塞更短，超时检查更频繁，单次卡顿控制在 ~500ms 内
+        const unsigned long SEND_TIMEOUT_MS = 500;
+        const size_t CHUNK = 512;
+        wsCam.poll();
+        String meta = "META:" + String(item.frame_id) + ":" + String(item.t_capture_ms) + ":" + String(fb->len);
+        bool meta_ok = wsCam.send(meta);
+        if (meta_ok) {
+          frame_meta_sent_count++;
+        }
+        if (meta_ok) {
+          ok = true;
+          for (size_t off = 0; off < (size_t)fb->len && ok; off += CHUNK) {
+            if (millis() - send_start > SEND_TIMEOUT_MS) {
+              wsCam.send("DROP:" + String(item.frame_id));
+              ok = false;
+              timeout_abort = true;
+              break;
+            }
+            size_t n = (size_t)fb->len - off;
+            if (n > CHUNK) n = CHUNK;
+            if (!wsCam.sendBinary((const char*)(fb->buf + off), n)) {
+              ok = false;
+              break;
+            }
+            wsCam.poll();
+            vTaskDelay(pdMS_TO_TICKS(1));  // 让出 CPU 给 WiFi 栈，减轻下一块阻塞
+          }
         }
         unsigned long send_time = millis() - send_start;
         
         if (ok) {
+          consecutive_send_fail = 0;
           frame_sent_count++;
           last_sent_time = millis();
-          
-          // 监控发送耗时
-          if (send_time > 100) {
-            Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
+          if (send_time > 200) {
+            Serial.printf("[CAM-SEND] send %lu ms (size=%u)\n", send_time, fb->len);
           }
         } else {
-          ws_send_fail_count++;
-          Serial.printf("[CAM-SEND] ERROR: send failed after %d retries, closing...\n", WS_SEND_RETRY);
+          if (!timeout_abort) {
+            ws_send_fail_count++;
+            consecutive_send_fail++;
+            Serial.printf("[CAM-SEND] ERROR: send failed (meta_ok=%d), consec_fail=%d\n", meta_ok ? 1 : 0, consecutive_send_fail);
+          } else {
+            consecutive_send_fail = 0;
+            Serial.printf("[CAM-SEND] timeout %lu ms, drop frame (size=%u)\n", send_time, fb->len);
+          }
           esp_camera_fb_return(fb);
-          wsCam.close(); 
-          cam_ws_ready = false;
+          // 瞬时失败不立刻断线，避免频繁重连导致 1~2s 卡顿
+          // 仅连续失败较多时才重建连接，给网络短抖动恢复机会
+          if (!wsCam.available()) {
+            cam_ws_ready = false;
+            consecutive_send_fail = 0;
+          } else if (consecutive_send_fail >= 30) {
+            Serial.println("[CAM-SEND] too many consecutive send failures, reconnect ws");
+            wsCam.close();
+            cam_ws_ready = false;
+            consecutive_send_fail = 0;
+          }
           continue;
         }
         
         esp_camera_fb_return(fb);
+        // 帧间延迟：有 FPS 上限时由下一轮开头的 period 限速即可，不再固定 30ms；无上限时短让出给 WiFi
+        if (g_target_fps > 0) {
+          unsigned long period_ms = 1000 / (unsigned long)g_target_fps;
+          long delay_ms = (long)period_ms - (long)send_time;
+          if (delay_ms > 5) vTaskDelay(pdMS_TO_TICKS((uint32_t)delay_ms));
+          else vTaskDelay(pdMS_TO_TICKS(5));
+        } else {
+          vTaskDelay(pdMS_TO_TICKS(10));
+        }
         
         // 每5秒打印一次发送统计
         unsigned long now = millis();
         if (now - last_log > 5000) {
           unsigned long gap = now - last_sent_time;
-          Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n", 
-                        frame_sent_count, frame_dropped_count, ws_send_fail_count, gap);
+          Serial.printf("[CAM-SEND] sent=%lu, meta=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n", 
+                        frame_sent_count, frame_meta_sent_count, frame_dropped_count, ws_send_fail_count, gap);
           last_log = now;
         }
         
@@ -270,7 +390,10 @@ void taskCamSend(void*) {
         esp_camera_fb_return(fb); 
       }
     } else {
-      // 队列接收超时，检查是否长时间没有帧
+      // 空闲时由本任务统一 poll，处理 ping/pong，避免仅 taskWsService poll 时的并发冲突
+      if (cam_ws_ready) {
+        wsCam.poll();
+      }
       unsigned long now = millis();
       if (cam_ws_ready && last_sent_time > 0 && (now - last_sent_time) > 3000) {
         Serial.printf("[CAM-SEND] WARNING: No frame sent for %lu ms\n", now - last_sent_time);
@@ -324,6 +447,63 @@ void taskMicUpload(void*){
     } else {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
+  }
+}
+
+// ====================================================================
+// WebSocket service task: reconnect + poll + audio control dispatch
+// ====================================================================
+void taskWsService(void*){
+  unsigned long last_cam_reconnect_ms = 0;
+  unsigned long last_aud_reconnect_ms = 0;
+  for(;;){
+    unsigned long now = millis();
+
+    // camera ws reconnect (non-blocking cadence)
+    if (!wsCam.available() && (now - last_cam_reconnect_ms >= 500)) {
+      last_cam_reconnect_ms = now;
+      if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
+        Serial.println("[WS-CAM] connected");
+      } else {
+        Serial.println("[WS-CAM] reconnect pending...");
+      }
+    }
+
+    // audio ws reconnect (non-blocking cadence)
+    if (!wsAud.available() && (now - last_aud_reconnect_ms >= 1000)) {
+      last_aud_reconnect_ms = now;
+      if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
+        Serial.println("[WS-AUD] connected");
+        run_audio_stream = false;  // 连接后保持待机，由按键触发
+#if ENABLE_TTS_PLAYBACK
+        startStreamWav();
+#else
+        Serial.println("[AUDIO] TTS playback disabled, use /stream_phone.wav on phone");
+#endif
+      } else {
+        Serial.println("[WS-AUD] reconnect pending...");
+      }
+    }
+
+    // dispatch pending audio command (single writer for wsAud.send text control)
+    int cmd = g_pending_aud_cmd;
+    if (cmd != AUD_CMD_NONE && wsAud.available() && aud_ws_ready) {
+      if (cmd == AUD_CMD_START) {
+        wsAud.send("START");
+      } else if (cmd == AUD_CMD_STOP) {
+        wsAud.send("STOP");
+      } else if (cmd == AUD_CMD_RESTART) {
+        run_audio_stream = false;
+        xQueueReset(qAudio);
+        wsAud.send("START");
+        run_audio_stream = true;
+      }
+      g_pending_aud_cmd = AUD_CMD_NONE;
+    }
+
+    // 仅 AUD 在此 task 里 poll；CAM 由 taskCamSend 独占 poll+send，避免双任务并发踩 wsCam 导致断连
+    wsAud.poll();
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 
@@ -878,11 +1058,186 @@ void taskImuLoop(void*){
 }
 
 // ====================================================================
+// OMI 电池管理 & 电源控制（深度睡眠）
+// ====================================================================
+
+#if HW_VARIANT_OMI_GLASS
+
+void readBatteryLevel() {
+  // 多次采样取平均，降低抖动
+  int adcSum = 0;
+  for (int i = 0; i < 10; i++) {
+    int value = analogRead(BATTERY_ADC_PIN);
+    adcSum += value;
+    delay(5);
+  }
+  int adcValue = adcSum / 10;
+
+  // ESP32-S3 ADC: 12-bit (0-4095), 参考电压约 3.3V
+  float adcVoltage = (adcValue / 4095.0f) * 3.3f;
+
+  // 通过分压比换算成实际电池电压
+  batteryVoltage = adcVoltage * VOLTAGE_DIVIDER_RATIO;
+
+  // 限制到合理范围
+  if (batteryVoltage > 5.0f) batteryVoltage = 5.0f;
+  if (batteryVoltage < 2.5f) batteryVoltage = 2.5f;
+
+  // 线性映射成百分比（在 MIN~MAX 之间）
+  if (batteryVoltage >= BATTERY_MAX_VOLTAGE) {
+    batteryPercentage = 100;
+  } else if (batteryVoltage <= BATTERY_MIN_VOLTAGE) {
+    batteryPercentage = 0;
+  } else {
+    float range = BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE;
+    batteryPercentage = (int)(((batteryVoltage - BATTERY_MIN_VOLTAGE) / range) * 100.0f);
+  }
+
+  if (batteryPercentage > 100) batteryPercentage = 100;
+  if (batteryPercentage < 0)   batteryPercentage = 0;
+
+  Serial.print("[BAT] ");
+  Serial.print(batteryVoltage, 3);
+  Serial.print(" V (");
+  Serial.print(batteryPercentage);
+  Serial.println(" %)");
+}
+
+void shutdownDevice() {
+  Serial.println("[POWER] Shutting down device (OMI)...");
+
+  // 停止录音/推流
+  run_audio_stream = false;
+
+  // 关闭 WebSocket 连接
+  wsCam.close();
+  cam_ws_ready = false;
+  wsAud.close();
+  aud_ws_ready = false;
+
+  // 等用户松开按键，再配置按键唤醒，避免“按住不放→立刻又唤醒”的循环
+  while (digitalRead(PTT_BUTTON_PIN) == LOW) {
+    delay(10);
+  }
+
+  // 关闭状态灯（OMI 的 LED 为低电平点亮）
+  digitalWrite(STATUS_LED_PIN, HIGH);
+
+  // 配置按键唤醒（严格对齐 OMI：GPIO1 电源键，低电平唤醒）
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, 0);
+
+  Serial.println("[POWER] Entering deep sleep, press power button to wake.");
+  delay(100);
+  esp_deep_sleep_start();
+}
+
+#else
+
+// 非 OMI 变体下，仅提供空实现，方便复用长按关机逻辑（实为软复位）
+void readBatteryLevel() {}
+
+void shutdownDevice() {
+  Serial.println("[POWER] Long press -> deep sleep (dev board)");
+  run_audio_stream = false;
+  wsCam.close();
+  cam_ws_ready = false;
+  wsAud.close();
+  aud_ws_ready = false;
+  // 不配置任何外部唤醒源，避免被同一个按键/噪声立刻唤醒
+  // 只保留上电/RESET 唤醒
+  // （如果你想测试定时唤醒，可以打开下面这行）
+  // esp_sleep_enable_timer_wakeup(10ULL * 60ULL * 1000000ULL); // 10 分钟后自动醒
+  delay(100);
+  while (digitalRead(PTT_BUTTON_PIN) == LOW) {
+    delay(10);
+  }
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, 0);
+  esp_deep_sleep_start();
+  // 不会执行到这里
+}
+
+#endif
+
+// 按键处理：短按切换录音，长按关机
+void handleButtonLogic() {
+  static unsigned long lastDebounceTime = 0;
+  static bool buttonDown = false;
+  static bool longPressTriggered = false;
+  static unsigned long pressStartTime = 0;
+
+  unsigned long now = millis();
+  bool level = digitalRead(PTT_BUTTON_PIN);   // INPUT_PULLUP: HIGH=未按, LOW=按下
+
+  // 简单防抖：电平变化后等待一段时间再确认
+  if (level != ptt_last_level) {
+    lastDebounceTime = now;
+    ptt_last_level = level;
+  }
+
+  if (now - lastDebounceTime < 30) {
+    return;
+  }
+
+  bool pressed = !level;
+
+  if (pressed && !buttonDown) {
+    // 刚按下
+    buttonDown = true;
+    longPressTriggered = false;
+    pressStartTime = now;
+  }
+  else if (pressed && buttonDown && !longPressTriggered) {
+    // 按住，判断是否达到长按阈值
+    if (now - pressStartTime >= 2000) {
+      longPressTriggered = true;
+      Serial.println("[BTN] LONG -> POWER OFF");
+#if HW_VARIANT_OMI_GLASS
+      // OMI Glass：仅触发关机序列，由 LED 状态机稍后调用 shutdownDevice（对齐原固件）
+      ledMode = LED_POWER_OFF_SEQUENCE;
+      powerOffStartTime = 0;  // 让 LED 状态机在下次 update 时记录起始时间
+#else
+      // 开发板：直接关机（深度睡眠，不配置按键唤醒）
+      shutdownDevice();
+#endif
+    }
+  }
+  else if (!pressed && buttonDown) {
+    // 刚松开
+    buttonDown = false;
+    unsigned long pressDuration = now - pressStartTime;
+
+    if (!longPressTriggered && pressDuration >= 50) {
+      // 短按：切换录音 START / STOP
+      if (wsAud.available()) {
+        ptt_recording = !ptt_recording;
+        if (ptt_recording) {
+          Serial.println("[BTN] SHORT -> START");
+          run_audio_stream = true;
+          g_pending_aud_cmd = AUD_CMD_START;
+        } else {
+          Serial.println("[BTN] SHORT -> STOP");
+          run_audio_stream = false;
+          g_pending_aud_cmd = AUD_CMD_STOP;
+        }
+      }
+    }
+  }
+}
+
+// ====================================================================
 // Setup / Loop
 // ====================================================================
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  // 打印唤醒来源（便于确认是上电还是按键唤醒）
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  Serial.print("[WAKE] cause=");
+  Serial.println((int)cause);
+
+  // 先把按键设成上拉输入，避免悬空误判为按下
+  pinMode(PTT_BUTTON_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -892,13 +1247,59 @@ void setup() {
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WiFi] connecting");
-  while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
+
+  // 在等待 WiFi 连接期间，也允许全局长按关机
+  unsigned long wifi_start = millis();
+  while (WiFi.status()!=WL_CONNECTED){
+    delay(50);
+    Serial.print(".");
+
+    // 简单长按检测：任意时刻都可触发关机
+    static bool btn_down_in_setup = false;
+    static unsigned long btn_press_start_setup = 0;
+    static bool logged_poweroff_in_setup = false;
+
+    bool level = digitalRead(PTT_BUTTON_PIN);     // INPUT_PULLUP: HIGH=未按, LOW=按下
+    bool pressed = !level;
+    unsigned long now = millis();
+
+    if (pressed && !btn_down_in_setup) {
+      btn_down_in_setup = true;
+      btn_press_start_setup = now;
+    } else if (pressed && btn_down_in_setup) {
+      if (now - btn_press_start_setup >= 2000) {
+        if (!logged_poweroff_in_setup) {
+          Serial.println("[BTN][SETUP] LONG -> POWER OFF (while waiting WiFi)");
+          logged_poweroff_in_setup = true;
+        }
+        // 等待 WiFi 时，直接硬关机（深度睡眠），不用再进入 loop 的关机序列
+        shutdownDevice();
+      }
+    } else if (!pressed && btn_down_in_setup) {
+      btn_down_in_setup = false;
+    }
+  }
   Serial.println(" OK " + WiFi.localIP().toString());
 
   if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
 
-  // PTT 按键：D1(GPIO2)，上拉输入
-  pinMode(PTT_BUTTON_PIN, INPUT_PULLUP);
+#if HW_VARIANT_OMI_GLASS
+  // OMI 状态灯：低电平点亮
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, HIGH);  // 默认熄灭
+
+  // 默认进入正常工作 LED 模式
+  ledMode = LED_NORMAL_OPERATION;
+
+#if ENABLE_OMI_BATTERY_READ
+  // 电池 ADC 配置（关掉后不碰 GPIO2/ADC，可排查是否导致 FPS 低）
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  readBatteryLevel();
+#else
+  Serial.println("[BAT] disabled for FPS test (ENABLE_OMI_BATTERY_READ=0)");
+#endif
+#endif
 
   // 若未接 IMU，可通过 ENABLE_IMU 关闭
 #if ENABLE_IMU
@@ -912,12 +1313,13 @@ void setup() {
   init_i2s_out();
 #endif
 
-  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 增加到3个缓冲，减少丢帧
+  qFrames = xQueueCreate(2, sizeof(CamFrameItem));  // 小队列+丢旧帧，优先最新画面
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
 
   xTaskCreatePinnedToCore(taskCamCapture, "cam_cap", 10240, NULL, 4, NULL, 1);
   xTaskCreatePinnedToCore(taskCamSend,    "cam_snd",  8192, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(taskWsService,  "ws_svc",   6144, NULL, 3, NULL, 0);
   xTaskCreatePinnedToCore(taskMicCapture, "mic_cap",   4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
   // 如无 IMU，可关闭此任务
@@ -935,14 +1337,15 @@ void setup() {
       Serial.println("[WS-CAM] open");
       // 重置统计
       frame_sent_count = 0;
+      frame_meta_sent_count = 0;
       frame_dropped_count = 0;
       ws_send_fail_count = 0;
       last_stats_time = millis();
     }
     if (ev == WebsocketsEvent::ConnectionClosed)  { 
       cam_ws_ready = false; 
-      Serial.printf("[WS-CAM] closed (sent=%lu, dropped=%lu, fail=%lu)\n", 
-                    frame_sent_count, frame_dropped_count, ws_send_fail_count);
+      Serial.printf("[WS-CAM] closed (sent=%lu, meta=%lu, dropped=%lu, fail=%lu)\n", 
+                    frame_sent_count, frame_meta_sent_count, frame_dropped_count, ws_send_fail_count);
     }
   });
 
@@ -1018,60 +1421,55 @@ void setup() {
     if (msg.isText()){
       String s = msg.data(); s.trim();
       if (s == "RESTART"){
-        run_audio_stream = false; xQueueReset(qAudio); delay(50);
-        wsAud.send("START"); run_audio_stream = true;
+        g_pending_aud_cmd = AUD_CMD_RESTART;
       }
     }
   });
 }
 
 void loop() {
-  if (!wsCam.available()) {
-    if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
-      Serial.println("[WS-CAM] connected");
-    } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
-  }
+  // OMI Glass：先跑 LED 状态机，处理关机闪烁和最终 deep sleep（严格对齐原固件）
+#if HW_VARIANT_OMI_GLASS
+  if (ledMode == LED_POWER_OFF_SEQUENCE) {
+    static unsigned long localPowerOffStart = 0;
+    unsigned long nowLed = millis();
 
-  if (!wsAud.available()) {
-    if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
-      Serial.println("[WS-AUD] connected");
-      delay(50);
-      // 连上后先不录音，由按键控制 START/STOP
-      run_audio_stream = false;
-#if ENABLE_TTS_PLAYBACK
-      startStreamWav();   // /stream.wav (chunked) — 关闭时改为手机播报
-#else
-      Serial.println("[AUDIO] TTS playback disabled, use /stream_phone.wav on phone");
-#endif
-    } else { Serial.println("[WS-AUD] retry in 2s..."); delay(2000); }
-  }
+    if (localPowerOffStart == 0) {
+      localPowerOffStart = nowLed;
+    }
 
-  // PTT：按一下开始录音并发送 START；再按一下结束录音并发送 STOP
-  if (wsAud.available()) {
-    bool level = digitalRead(PTT_BUTTON_PIN);  // HIGH=未按, LOW=按下
-    if (level != ptt_last_level) {
-      delay(15); // 简单防抖
-      level = digitalRead(PTT_BUTTON_PIN);
-      if (level != ptt_last_level) {
-        ptt_last_level = level;
-        if (!level) {
-          // 按下瞬间：切换录音状态
-          ptt_recording = !ptt_recording;
-          if (ptt_recording) {
-            Serial.println("[PTT] CLICK -> START");
-            run_audio_stream = true;
-            wsAud.send("START");
-          } else {
-            Serial.println("[PTT] CLICK -> STOP");
-            run_audio_stream = false;
-            wsAud.send("STOP");
-          }
-        }
-      }
+    // 2 次快速闪烁，总时长 ~800ms（与 OMI 一致）
+    if (nowLed - localPowerOffStart < 800) {
+      int blinkPhase = ((nowLed - localPowerOffStart) / 200) % 2;
+      digitalWrite(STATUS_LED_PIN, blinkPhase ? HIGH : LOW); // 反相：LOW=亮
+    } else {
+      // 结束闪烁，真正关机
+      digitalWrite(STATUS_LED_PIN, HIGH); // 熄灭
+      localPowerOffStart = 0;
+      ledMode = LED_NORMAL_OPERATION;
+      shutdownDevice();                  // 进入深度睡眠（含 GPIO1 按键唤醒）
+      return;                            // 理论上不会再执行
     }
   }
+#endif
+  // 按键：短按录音 START/STOP，长按关机（深度睡眠 / 软重启）
+  handleButtonLogic();
 
-  wsCam.poll();
-  wsAud.poll();
+#if HW_VARIANT_OMI_GLASS
+#if ENABLE_OMI_BATTERY_READ
+  // 周期性电池检测，电压过低则自动进入深度睡眠
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck >= BATTERY_TASK_INTERVAL_MS) {
+    lastCheck = now;
+    readBatteryLevel();
+    if (batteryVoltage <= BATTERY_CRITICAL_VOLTAGE) {
+      Serial.println("[BAT] critical, entering deep sleep");
+      shutdownDevice();
+    }
+  }
+#endif
+#endif
+
   delay(2);
 }

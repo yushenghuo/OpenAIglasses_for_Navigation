@@ -6,7 +6,7 @@ from typing import AsyncGenerator, Dict, Any, List, Optional, Tuple
 from openai import OpenAI
 
 # ===== OpenAI 兼容（达摩院 DashScope 兼容模式）=====
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-a9440db694924559ae4ebdc2023d2b9a")
+API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-cbf76a89a77a46ffba38844dd1308f2b")
 if not API_KEY:
     raise RuntimeError("未设置 DASHSCOPE_API_KEY")
 

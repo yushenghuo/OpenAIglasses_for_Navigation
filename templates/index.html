@@ -39,61 +39,7 @@
   .kv{display:flex; justify-content:space-between; align-items:center;
       border-top:1px dashed rgba(255,255,255,.15); padding-top:6px; margin-top:6px; color:var(--muted); font-size:12px}
 
-  /* 左上角 IMU 浮窗 —— 宽一些 + 横向布局：左模型 / 右数据 */
-  .imu-float{
-    position:absolute; left:12px; top:12px; z-index:35;
-    width: 900px;                /* ← 加长：横向空间更大 */
-    border:2px dashed rgba(255,255,255,.35);
-    border-radius:12px;
-    background:var(--panel);
-    backdrop-filter: blur(8px) saturate(130%);
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
-    padding:10px;
-  }
-  .imu-row{
-    display:grid;
-    grid-template-columns: 1.8fr 1fr;  /* ← 左更宽，右放数据 */
-    gap:12px;
-    align-items:stretch;
-  }
-  #imu_view{
-    position:relative;
-    min-height: 300px;           /* ← 模型区域更高 */
-    background:#0a1017; border-radius:10px;
-  }
-  #imu_hud{
-  border-radius: 10px;
-  background: rgba(18, 24, 33, 0.8);  /* 改为半透明 */
-  border: none;
-  padding: 10px;
-  overflow-y: auto;  /* 启用垂直滚动条 */
-  max-height: 100vh;  /* 设置最大高度为视口高度，自动撑满 */
-}
-
-#imu_hud::-webkit-scrollbar {
-  width: 8px;  /* 滚动条的宽度 */
-}
-
-#imu_hud::-webkit-scrollbar-thumb {
-  background-color: #2a6df4;  /* 滑块的颜色 */
-  border-radius: 4px;  /* 滑块的圆角 */
-}
-
-#imu_hud::-webkit-scrollbar-track {
-  background-color: #111a2e;  /* 滚动条轨道的颜色 */
-  border-radius: 4px;  /* 滚动条轨道的圆角 */
-}
-
-  #imu_top_status{position:absolute; top:10px; right:10px; z-index:2}
-  #imu_top_status .badge{background:rgba(0,0,0,.35); border-color:#2d3b50}
-
-  /* 角标 + 当前指令（角标在浮窗下） */
-  .badge-tag{
-    position:absolute; left:12px; top: calc(12px + 300px + 28px); z-index:20;
-    background:linear-gradient(120deg, rgba(47,134,255,.9), rgba(26,88,255,.9));
-    color:#fff; padding:6px 10px; font-weight:700; font-size:12px; border-radius:999px;
-    box-shadow:0 6px 16px rgba(47,134,255,.35)
-  }
+  /* （原左上角 IMU 浮窗样式已删除） */
   .command{
     position:absolute; left:50%; bottom:46px; transform:translateX(-50%); z-index:25;
     display:flex; gap:10px; align-items:center; padding:12px 18px; border-radius:999px;
@@ -189,22 +135,6 @@
   <!-- 左侧主舞台 -->
   <section class="stage">
     <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
-
-    <!-- 左上角：IMU 浮窗（横向） -->
-    <div class="imu-float">
-      <div class="imu-row">
-        <div id="imu_view"></div>
-        <div id="imu_hud"><!-- JS 会把“IMU 实时数据面板”插到这里 --></div>
-      </div>
-      <div id="imu_top_status" style="display: none;">
-        <span class="badge">UDP: <code>12345</code></span>
-        <span class="badge">Browser WS: <code>/ws</code></span>
-        <span class="badge" id="imu_ws_state">connecting…</span>
-      </div>
-    </div>
-
-
-
   </section>
 
   <!-- 右侧聊天 -->

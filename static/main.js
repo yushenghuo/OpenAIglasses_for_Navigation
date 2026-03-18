@@ -228,17 +228,32 @@
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
   let wsCam, wsUI, frames = 0, fpsTimer = 0;
+  let lastMaskThumbImg = null;
+
+  function drawMainAndThumb(img){
+    fitCanvas();
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    if (lastMaskThumbImg){
+      const w = canvas.width / 4;
+      const h = canvas.height / 4;
+      const x = canvas.width - w - 8;
+      const y = 8;
+      ctx.drawImage(lastMaskThumbImg, x, y, w, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x, y, w, h);
+    }
+  }
 
   function drawBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
     if ('createImageBitmap' in window){
       createImageBitmap(blob).then(bmp=>{
-        fitCanvas();
-        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+        drawMainAndThumb(bmp);
       }).catch(()=>{});
     }else{
       const img = new Image();
-      img.onload = ()=>{ fitCanvas(); ctx.drawImage(img,0,0,canvas.width,canvas.height); URL.revokeObjectURL(img.src); };
+      img.onload = ()=>{ drawMainAndThumb(img); URL.revokeObjectURL(img.src); };
       img.src = URL.createObjectURL(blob);
     }
     frames++;
@@ -294,6 +309,15 @@
             });
           }
         }catch(e){}
+        return;
+      }
+      if (s.startsWith('MASKTHUMB:')){
+        const b64 = s.slice(10);
+        if (b64){
+          const img = new Image();
+          img.onload = ()=>{ lastMaskThumbImg = img; };
+          img.src = 'data:image/jpeg;base64,' + b64;
+        }
         return;
       }
       if (s.startsWith('PARTIAL:')){ 

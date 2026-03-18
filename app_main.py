@@ -5,8 +5,41 @@ from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
 import re
+
+# ---- .env（尽量早加载，确保 os.getenv 生效）----
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOTENV_PATH = os.path.join(BASE_DIR, ".env")
+
+def _load_project_dotenv() -> None:
+    # 1) 优先用 python-dotenv（若已安装）
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(dotenv_path=DOTENV_PATH, override=False)
+        return
+    except Exception:
+        pass
+
+    # 2) 兜底：手动解析 .env（支持 KEY=VALUE，忽略空行/注释）
+    try:
+        if not os.path.exists(DOTENV_PATH):
+            return
+        with open(DOTENV_PATH, "r", encoding="utf-8") as f:
+            for raw in f.read().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and (k not in os.environ):
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+_load_project_dotenv()
+
 # 在其它 import 之后加：
-from navigation_master import NavigationMaster, OrchestratorResult 
+from navigation_master import NavigationMaster, OrchestratorResult
 # 新增：导入盲道导航器
 from workflow_blindpath import BlindPathNavigator
 # 新增：导入过马路导航器
@@ -55,20 +88,12 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-# ---- .env ----
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
 # ---- 本地 Whisper ASR 配置（连续流式 + 唤醒词）----
 SAMPLE_RATE  = 16000
 CHUNK_MS     = 20
 BYTES_CHUNK  = SAMPLE_RATE * CHUNK_MS // 1000 * 2
 
 # Whisper 模型配置：优先使用环境变量，否则默认使用项目下 model/whisper 目录
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WHISPER_MODEL_DIR = os.getenv("WHISPER_MODEL_DIR", os.path.join(BASE_DIR, "model", "whisper"))
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 _whisper_model = None
@@ -135,10 +160,13 @@ from asr_core import (
 from audio_player import initialize_audio_system, play_voice_text, play_audio_threadsafe
 from cloud_nav_tts import synth_nav_tts_and_enqueue
 
-# ---- 同步录制器 ----
-import sync_recorder
-import signal
-import atexit
+# ---- 同步录制器（默认关闭，可用环境变量开启） ----
+# AIGLASS_ENABLE_RECORDER=1 开启；否则不启动录制，也不写入磁盘
+ENABLE_RECORDER = os.getenv("AIGLASS_ENABLE_RECORDER", "0").strip().lower() in ("1", "true", "yes", "on")
+if ENABLE_RECORDER:
+    import sync_recorder
+    import signal
+    import atexit
 
 # ---- IMU UDP ----
 UDP_IP   = "0.0.0.0"
@@ -167,6 +195,7 @@ navigation_active = False
 # segformer 分割模型打包：{"processor": ..., "model": ..., "device": ...}
 segformer_bundle = None
 obstacle_detector = None
+crosswalk_seg_model = None
 
 # 【高德/谷歌地图导航】从 darksight 迁移
 latest_user_position: Optional[Tuple[float, float]] = None  # (lng, lat) WGS84
@@ -197,7 +226,7 @@ omni_previous_nav_state = None  # 保存omni激活前的导航状态，用于恢
 # 【新增】模型加载函数
 def load_navigation_models():
     """加载导航相关模型：SegFormer 可通行区域分割 + 障碍物检测"""
-    global segformer_bundle, obstacle_detector
+    global segformer_bundle, obstacle_detector, crosswalk_seg_model
 
     try:
         # 加载 SegFormer 语义分割模型（可通行区域）
@@ -229,8 +258,32 @@ def load_navigation_models():
                     print(f"[NAVIGATION] SegFormer 模型加载失败: {e}")
             else:
                 print(f"[NAVIGATION] 未找到 SegFormer 模型目录: {segformer_dir}")
+
+        # 加载斑马线专用分割模型（YOLO）
+        crosswalk_model_path = os.getenv(
+            "CROSSWALK_MODEL",
+            os.getenv("BLIND_PATH_MODEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yolo-seg.pt")),
+        )
+        if os.path.exists(crosswalk_model_path):
+            try:
+                from ultralytics import YOLO
+
+                print(f"[NAVIGATION] 尝试加载斑马线专用模型: {crosswalk_model_path}")
+                crosswalk_seg_model = YOLO(crosswalk_model_path)
+                dev = get_device()
+                if dev != "cpu":
+                    try:
+                        crosswalk_seg_model.to(dev)
+                    except Exception as e:
+                        print(f"[NAVIGATION] 斑马线模型切换到 {dev} 失败，继续默认设备: {e}")
+                print("[NAVIGATION] 斑马线专用模型加载成功")
+            except Exception as e:
+                crosswalk_seg_model = None
+                print(f"[NAVIGATION] 斑马线专用模型加载失败: {e}")
+        else:
+            print(f"[NAVIGATION] 未找到斑马线专用模型文件: {crosswalk_model_path}")
             
-        # 【修改开始】使用 ObstacleDetectorClient 替代直接的 YOLO
+        # 【修改开始】使用 ObstacleDetectorClient 替代直接的 YOLO，并强制迁移到与 SegFormer 相同设备（如 MPS）
         obstacle_model_path = os.getenv("OBSTACLE_MODEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yoloe-11l-seg.pt"))
         print(f"[NAVIGATION] 尝试加载障碍物检测模型: {obstacle_model_path}")
         
@@ -239,14 +292,26 @@ def load_navigation_models():
             try:
                 # 使用 ObstacleDetectorClient 封装的 YOLO-E
                 obstacle_detector = ObstacleDetectorClient(model_path=obstacle_model_path)
-                print(f"[NAVIGATION] ========== YOLO-E 障碍物检测器加载成功 ==========")
+
+                # 统一设备：尽量与其它模型一致（MPS 优先）
+                try:
+                    dev = get_device()
+                    if hasattr(obstacle_detector, "model") and obstacle_detector.model is not None:
+                        if dev != "cpu":
+                            obstacle_detector.model.to(dev)
+                        # 同步文本特征到同一 device，避免每次 detect 时来回拷贝
+                        if hasattr(obstacle_detector, "whitelist_embeddings") and obstacle_detector.whitelist_embeddings is not None:
+                            try:
+                                obstacle_detector.whitelist_embeddings = obstacle_detector.whitelist_embeddings.to(dev)
+                            except Exception:
+                                pass
+                        print(f"[NAVIGATION] YOLO-E 模型已初始化，设备: {next(obstacle_detector.model.parameters()).device}")
+                    else:
+                        print(f"[NAVIGATION] 警告：YOLO-E 模型初始化异常")
+                except Exception as e:
+                    print(f"[NAVIGATION] YOLO-E 切换设备失败，保持原设备: {e}")
                 
-                # 检查模型是否成功加载
-                if hasattr(obstacle_detector, 'model') and obstacle_detector.model is not None:
-                    print(f"[NAVIGATION] YOLO-E 模型已初始化")
-                    print(f"[NAVIGATION] 模型设备: {next(obstacle_detector.model.parameters()).device}")
-                else:
-                    print(f"[NAVIGATION] 警告：YOLO-E 模型初始化异常")
+                print(f"[NAVIGATION] ========== YOLO-E 障碍物检测器加载成功 ==========")
                 
                 # 检查白名单是否成功加载
                 if hasattr(obstacle_detector, 'WHITELIST_CLASSES'):
@@ -257,8 +322,8 @@ def load_navigation_models():
                 
                 # 检查文本特征是否成功预计算
                 if hasattr(obstacle_detector, 'whitelist_embeddings') and obstacle_detector.whitelist_embeddings is not None:
-                    print(f"[NAVIGATION] YOLO-E 文本特征已预计算")
-                    print(f"[NAVIGATION] 文本特征张量形状: {obstacle_detector.whitelist_embeddings.shape if hasattr(obstacle_detector.whitelist_embeddings, 'shape') else '未知'}")
+                    shape = getattr(obstacle_detector.whitelist_embeddings, "shape", "未知")
+                    print(f"[NAVIGATION] YOLO-E 文本特征已预计算，shape={shape}")
                 else:
                     print(f"[NAVIGATION] 警告：YOLO-E 文本特征未预计算")
                 
@@ -303,36 +368,42 @@ def load_navigation_models():
 # 在程序启动时加载模型
 print("[NAVIGATION] 开始加载导航模型...")
 load_navigation_models()
-print(f"[NAVIGATION] 模型加载完成 - SegFormer: {segformer_bundle is not None}")
+print(
+    f"[NAVIGATION] 模型加载完成 - SegFormer: {segformer_bundle is not None}, "
+    f"CrosswalkYOLO: {crosswalk_seg_model is not None}"
+)
 
-# 【新增】启动同步录制
-print("[RECORDER] 启动同步录制系统...")
-sync_recorder.start_recording()
-print("[RECORDER] 录制系统已启动，将自动保存视频和音频")
+if ENABLE_RECORDER:
+    # 【新增】启动同步录制
+    print("[RECORDER] 启动同步录制系统...")
+    sync_recorder.start_recording()
+    print("[RECORDER] 录制系统已启动，将自动保存视频和音频")
 
-# 【新增】注册退出处理器，确保Ctrl+C时保存录制文件
-def cleanup_on_exit():
-    """程序退出时的清理工作"""
-    print("\n[SYSTEM] 正在关闭录制器...")
-    try:
-        sync_recorder.stop_recording()
-        print("[SYSTEM] 录制文件已保存")
-    except Exception as e:
-        print(f"[SYSTEM] 关闭录制器时出错: {e}")
+    # 【新增】注册退出处理器，确保Ctrl+C时保存录制文件
+    def cleanup_on_exit():
+        """程序退出时的清理工作"""
+        print("\n[SYSTEM] 正在关闭录制器...")
+        try:
+            sync_recorder.stop_recording()
+            print("[SYSTEM] 录制文件已保存")
+        except Exception as e:
+            print(f"[SYSTEM] 关闭录制器时出错: {e}")
 
-def signal_handler(sig, frame):
-    """处理Ctrl+C信号"""
-    print("\n[SYSTEM] 收到中断信号，正在安全退出...")
-    cleanup_on_exit()
-    import sys
-    sys.exit(0)
+    def signal_handler(sig, frame):
+        """处理Ctrl+C信号"""
+        print("\n[SYSTEM] 收到中断信号，正在安全退出...")
+        cleanup_on_exit()
+        import sys
+        sys.exit(0)
 
-# 注册信号处理器
-signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
-atexit.register(cleanup_on_exit)  # 正常退出时也调用
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
+    atexit.register(cleanup_on_exit)  # 正常退出时也调用
 
-print("[RECORDER] 已注册退出处理器 - Ctrl+C时会自动保存录制文件")
+    print("[RECORDER] 已注册退出处理器 - Ctrl+C时会自动保存录制文件")
+else:
+    print("[RECORDER] 已禁用（AIGLASS_ENABLE_RECORDER=0）")
 
 
 
@@ -385,6 +456,16 @@ async def ui_broadcast_final(text: str):
         recent_finals = recent_finals[-RECENT_MAX:]
     await ui_broadcast_raw("FINAL:" + text)
     print(f"[ASR/AI FINAL] {text}", flush=True)
+
+
+async def ui_broadcast_final_no_log(text: str):
+    """与 ui_broadcast_final 相同，但不打印终端日志，避免导航高频刷屏阻塞。"""
+    global current_partial, recent_finals
+    current_partial = ""
+    recent_finals.append(text)
+    if len(recent_finals) > RECENT_MAX:
+        recent_finals = recent_finals[-RECENT_MAX:]
+    await ui_broadcast_raw("FINAL:" + text)
 
 async def full_system_reset(reason: str = ""):
     """
@@ -1129,7 +1210,7 @@ async def ws_mobile_nav(ws: WebSocket):
 # ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, crosswalk_seg_model
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
@@ -1139,7 +1220,11 @@ async def ws_camera_esp(ws: WebSocket):
     
     # 【新增】初始化盲道导航器
     if blind_path_navigator is None and segformer_bundle is not None:
-        blind_path_navigator = BlindPathNavigator(segformer_bundle, obstacle_detector)
+        blind_path_navigator = BlindPathNavigator(
+            seg_model_bundle=segformer_bundle,
+            obstacle_detector=obstacle_detector,
+            crosswalk_seg_model=crosswalk_seg_model,
+        )
         print("[NAVIGATION] 可通行区域导航器已初始化 (SegFormer)")
     else:
         if blind_path_navigator is not None:
@@ -1149,28 +1234,178 @@ async def ws_camera_esp(ws: WebSocket):
     
     # 【新增】初始化过马路导航器
     if cross_street_navigator is None:
-        if segformer_bundle:
+        if segformer_bundle or crosswalk_seg_model is not None:
             # TODO: 将来如需在过马路导航中使用 SegFormer，可在这里接入；
             # 当前暂时保持简化：只要有分割模型，就初始化一个最小 navigator 占位。
             cross_street_navigator = CrossStreetNavigator(
-                seg_model=None,
+                seg_model=crosswalk_seg_model,
                 coco_model=None,
                 obs_model=None
             )
-            print("[CROSS_STREET] 过马路导航器已初始化（占位，尚未使用 SegFormer）")
+            print("[CROSS_STREET] 过马路导航器已初始化（已注入斑马线专用模型）")
         else:
-            print("[CROSS_STREET] 错误：缺少分割模型，无法初始化过马路导航器")
+            print("[CROSS_STREET] 错误：缺少斑马线模型，无法初始化过马路导航器")
     
     if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
         print("[NAV MASTER] 统领状态机已初始化（托管模式）")
     frame_counter = 0  # 添加帧计数器
     
-    # 用队列解耦「接收」和「处理」：单独任务持续从 WS 收帧，主循环从队列取帧处理，
-    # 避免处理（SegFormer/导航）阻塞时 TCP 缓冲区满导致 ESP32 send 失败并断连
-    frame_queue = asyncio.Queue(maxsize=3)
-    
+    # 用“最新帧”队列解耦接收和处理：
+    # - 队列长度固定为1，保证只处理最新画面，避免滞后帧排队；
+    # - ESP32 端会先发 META，再发 JPEG binary，服务端据此计算帧龄并丢弃旧帧。
+    frame_queue = asyncio.Queue(maxsize=1)
+    max_frame_age_ms = int(os.getenv("AIGLASS_MAX_FRAME_AGE_MS", "350"))
+    stats_window_sec = float(os.getenv("AIGLASS_CAM_STATS_WINDOW_SEC", "5.0"))
+    pending_meta = {"frame_id": None, "capture_ts_ms": None, "jpeg_len": None}
+    stale_drop_count = 0
+    queue_drop_count = 0
+    decode_fail_count = 0
+    meta_miss_count = 0
+    accepted_count = 0
+    age_samples_ms = deque(maxlen=400)
+    last_stats_log_t = time.time()
+    capture_clock_offset_ms = None
+    capture_offset_ema_alpha = float(os.getenv("AIGLASS_CAPTURE_OFFSET_ALPHA", "0.03"))
+    recorder_queue = asyncio.Queue(maxsize=1) if ENABLE_RECORDER else None
+    viewer_queue = asyncio.Queue(maxsize=1)
+    nav_ui_queue = asyncio.Queue(maxsize=6)
+    recorder_drop_count = 0
+    viewer_drop_count = 0
+    nav_ui_drop_count = 0
+    infer_samples_ms = deque(maxlen=400)
+    infer_drop_count = 0
+    nav_infer_task: Optional[asyncio.Task] = None
+    viewer_target_fps = int(os.getenv("AIGLASS_VIEWER_FPS", "30"))
+    viewer_target_fps = max(1, min(30, viewer_target_fps))
+
+    def _parse_meta_text(text: str):
+        # 协议: META:<frame_id>:<capture_ts_ms>:<jpeg_len>
+        if not text or not text.startswith("META:"):
+            return None
+        parts = text.split(":")
+        if len(parts) != 4:
+            return None
+        try:
+            return {
+                "frame_id": int(parts[1]),
+                "capture_ts_ms": int(parts[2]),
+                "jpeg_len": int(parts[3]),
+            }
+        except Exception:
+            return None
+
+    async def recorder_worker():
+        if not ENABLE_RECORDER or recorder_queue is None:
+            return
+        while True:
+            item = await recorder_queue.get()
+            if item is None:
+                break
+            try:
+                await asyncio.to_thread(sync_recorder.record_frame, item)
+            except Exception as e:
+                if frame_counter % 100 == 0:
+                    print(f"[RECORDER] 异步录制失败: {e}")
+
+    async def viewer_worker():
+        last_send_t = 0.0
+        while True:
+            img = await viewer_queue.get()
+            if img is None:
+                break
+            if not camera_viewers or img is None:
+                continue
+            now_t = time.time()
+            min_interval = 1.0 / float(viewer_target_fps)
+            if (now_t - last_send_t) < min_interval:
+                continue
+            try:
+                ok, enc = await asyncio.to_thread(
+                    cv2.imencode,
+                    ".jpg",
+                    img,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+                )
+            except Exception:
+                ok, enc = False, None
+            if not ok or enc is None:
+                continue
+            jpeg_data = enc.tobytes()
+            dead = []
+            for viewer_ws in list(camera_viewers):
+                try:
+                    await viewer_ws.send_bytes(jpeg_data)
+                except Exception:
+                    dead.append(viewer_ws)
+            for d in dead:
+                camera_viewers.discard(d)
+            last_send_t = time.time()
+
+    async def nav_ui_worker():
+        while True:
+            text = await nav_ui_queue.get()
+            if text is None:
+                break
+            try:
+                # 导航 UI 通道：
+                # - 普通文本（含 "[导航]"）走 FINAL:，用于对话区展示
+                # - 特殊前缀消息（例如 MASKTHUMB:）走原始通道，由前端自定义解析
+                if isinstance(text, str) and text.startswith("MASKTHUMB:"):
+                    await ui_broadcast_raw(text)
+                else:
+                    await ui_broadcast_final_no_log(text)
+            except Exception:
+                pass
+
+    async def run_orchestrator_infer(frame_bgr: np.ndarray, state_name: str):
+        """单帧导航推理任务：在线程中运行，避免阻塞相机主循环。"""
+        infer_t0 = time.time()
+        out_img = frame_bgr
+        guidance_text = ""
+        thumb_b64 = None
+        if state_name == "TRAFFIC_LIGHT_DETECTION":
+            import trafficlight_detection
+            result = await asyncio.to_thread(
+                trafficlight_detection.process_single_frame,
+                frame_bgr,
+                ui_broadcast_callback=ui_broadcast_final,
+            )
+            out_img = result['vis_image'] if result and result.get('vis_image') is not None else frame_bgr
+        else:
+            res = await asyncio.to_thread(orchestrator.process_frame, frame_bgr)
+            if res is not None:
+                guidance_text = res.guidance_text or ""
+                out_img = res.annotated_image if res.annotated_image is not None else frame_bgr
+        # 生成带有导航标注的缩略图（用于右上角小窗显示）
+        try:
+            if out_img is not None:
+                h, w = out_img.shape[:2]
+                max_w = 320
+                if w > max_w:
+                    scale = max_w / float(w)
+                    thumb = cv2.resize(out_img, (max_w, int(h * scale)))
+                else:
+                    thumb = out_img
+                ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                if ok:
+                    thumb_b64 = base64.b64encode(buf).decode("ascii")
+        except Exception:
+            thumb_b64 = None
+        infer_ms = (time.time() - infer_t0) * 1000.0
+        return {
+            "out_img": out_img,
+            "guidance_text": guidance_text,
+            "infer_ms": infer_ms,
+            "thumb_b64": thumb_b64,
+        }
+
+    # 工业级稳定：ESP32 分块发送，服务端按 META 的 jpeg_len 重组完整帧再解码，避免半包导致 Corrupt JPEG 与断连
+    binary_buffer = bytearray()
+    expected_jpeg_len: Optional[int] = None
+
     async def drain_camera_ws():
+        nonlocal pending_meta, queue_drop_count, capture_clock_offset_ms, binary_buffer, expected_jpeg_len
         try:
             while True:
                 msg = await ws.receive()
@@ -1181,12 +1416,51 @@ async def ws_camera_esp(ws: WebSocket):
                         frame_queue.get_nowait()
                         frame_queue.put_nowait(None)
                     return
+                txt = msg.get("text")
+                if txt:
+                    if txt.startswith("DROP:"):
+                        binary_buffer.clear()
+                        expected_jpeg_len = None
+                        continue
+                    meta = _parse_meta_text(txt)
+                    if meta is not None:
+                        pending_meta = meta
+                        expected_jpeg_len = meta.get("jpeg_len")
+                        binary_buffer.clear()
+                    continue
                 if msg.get("bytes"):
+                    binary_buffer.extend(msg["bytes"])
+                    if expected_jpeg_len is None or len(binary_buffer) < expected_jpeg_len:
+                        continue
+                    recv_ts = time.time()
+                    data = bytes(binary_buffer[:expected_jpeg_len])
+                    binary_buffer = binary_buffer[expected_jpeg_len:]
+                    if len(binary_buffer) > 0:
+                        binary_buffer.clear()
+                    cap_ts = pending_meta.get("capture_ts_ms")
+                    if cap_ts is not None:
+                        obs_off = (recv_ts * 1000.0) - float(cap_ts)
+                        if capture_clock_offset_ms is None:
+                            capture_clock_offset_ms = obs_off
+                        else:
+                            a = capture_offset_ema_alpha
+                            capture_clock_offset_ms = (1.0 - a) * capture_clock_offset_ms + a * obs_off
+                    packet = {
+                        "data": data,
+                        "recv_ts": recv_ts,
+                        "frame_id": pending_meta.get("frame_id"),
+                        "capture_ts_ms": pending_meta.get("capture_ts_ms"),
+                        "jpeg_len": expected_jpeg_len,
+                    }
                     try:
-                        frame_queue.put_nowait(msg["bytes"])
+                        frame_queue.put_nowait(packet)
                     except asyncio.QueueFull:
-                        frame_queue.get_nowait()
-                        frame_queue.put_nowait(msg["bytes"])
+                        queue_drop_count += 1
+                        try:
+                            _ = frame_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        frame_queue.put_nowait(packet)
         except WebSocketDisconnect:
             try:
                 frame_queue.put_nowait(None)
@@ -1200,114 +1474,212 @@ async def ws_camera_esp(ws: WebSocket):
                 pass
     
     drain_task = asyncio.create_task(drain_camera_ws())
+    recorder_task = asyncio.create_task(recorder_worker()) if ENABLE_RECORDER else None
+    viewer_task = asyncio.create_task(viewer_worker())
+    nav_ui_task = asyncio.create_task(nav_ui_worker())
     
     try:
         while True:
-            data = await frame_queue.get()
-            if data is None:
+            packet = await frame_queue.get()
+            if packet is None:
                 break
+            await asyncio.sleep(0)  # 让 drain_camera_ws 及时收包，减轻 ESP32 阻塞
+            data = packet.get("data")
+            if data is None:
+                continue
             frame_counter += 1
 
-            # 【新增】录制原始帧
-            try:
-                sync_recorder.record_frame(data)
-            except Exception as e:
-                if frame_counter % 100 == 0:  # 避免日志刷屏
-                    print(f"[RECORDER] 录制帧失败: {e}")
+            now_t = time.time()
+            capture_ts_ms = packet.get("capture_ts_ms")
+            if capture_ts_ms is not None and capture_clock_offset_ms is not None:
+                age_ms = (now_t * 1000.0) - (float(capture_ts_ms) + float(capture_clock_offset_ms))
+            else:
+                meta_miss_count += 1
+                age_ms = (now_t - float(packet.get("recv_ts", now_t))) * 1000.0
+
+            if age_ms > max_frame_age_ms:
+                stale_drop_count += 1
+                continue
+            accepted_count += 1
+            age_samples_ms.append(float(age_ms))
+
+            # 录制改为异步最新帧，避免磁盘写入阻塞主导航链路（可关闭）
+            if ENABLE_RECORDER and recorder_queue is not None:
+                try:
+                    recorder_queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    recorder_drop_count += 1
+                    try:
+                        _ = recorder_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    recorder_queue.put_nowait(data)
 
             try:
-                last_frames.append((time.time(), data))
+                last_frames.append((now_t, data))
             except Exception:
                 pass
 
             # 推送到bridge_io（供其它模块使用）
             bridge_io.push_raw_jpeg(data)
 
-            # 【调试】检查导航条件
-            if frame_counter % 30 == 0:
-                state_dbg = orchestrator.get_state() if orchestrator else "N/A"
+            # 【调试】检查导航条件（降低日志频率，减少IO抖动）
+            state_dbg = orchestrator.get_state() if orchestrator else "N/A"
+            dbg_mod = 60 if state_dbg in ("CHAT", "IDLE") else 90
+            if frame_counter % dbg_mod == 0:
                 print(f"[NAVIGATION DEBUG] 帧:{frame_counter}, state={state_dbg}")
 
-            # 统一解码（添加更严格的异常处理）
-            try:
-                arr = np.frombuffer(data, dtype=np.uint8)
-                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                # 验证解码结果
-                if bgr is None or bgr.size == 0:
-                    if frame_counter % 30 == 0:
-                        print(f"[JPEG] 解码失败：数据长度={len(data)}")
-                    bgr = None
-            except Exception as e:
+            # 解码放线程，高 FPS 时主循环不阻塞，drain_camera_ws 可持续收包
+            def _decode_jpeg(jpeg_bytes: bytes):
+                try:
+                    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    return bgr if (bgr is not None and bgr.size > 0) else None
+                except Exception:
+                    return None
+            bgr = await asyncio.to_thread(_decode_jpeg, data)
+            if bgr is None:
+                decode_fail_count += 1
                 if frame_counter % 30 == 0:
-                    print(f"[JPEG] 解码异常: {e}")
-                bgr = None
+                    print(f"[JPEG] 解码失败：数据长度={len(data)}")
+
+            # 高 FPS：每帧解码后立即推 viewer，作为统一预览画面
+            if bgr is not None:
+                try:
+                    viewer_queue.put_nowait(bgr)
+                except asyncio.QueueFull:
+                    viewer_drop_count += 1
+                    try:
+                        viewer_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    viewer_queue.put_nowait(bgr)
+
+            # 收割上一帧推理结果（如果完成）
+            if nav_infer_task is not None and nav_infer_task.done():
+                try:
+                    infer_result = nav_infer_task.result()
+                    infer_samples_ms.append(float(infer_result.get("infer_ms", 0.0)))
+                    thumb_b64 = infer_result.get("thumb_b64")
+                    gtxt = infer_result.get("guidance_text", "")
+                    if gtxt:
+                        try:
+                            nav_ui_queue.put_nowait(f"[导航] {gtxt}")
+                        except asyncio.QueueFull:
+                            nav_ui_drop_count += 1
+                            try:
+                                _ = nav_ui_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            nav_ui_queue.put_nowait(f"[导航] {gtxt}")
+                    if thumb_b64:
+                        try:
+                            nav_ui_queue.put_nowait("MASKTHUMB:" + thumb_b64)
+                        except asyncio.QueueFull:
+                            nav_ui_drop_count += 1
+                            try:
+                                _ = nav_ui_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            nav_ui_queue.put_nowait("MASKTHUMB:" + thumb_b64)
+                    # 为避免预览画面在“带标注/不带标注”之间交替，这里不再向 viewer_queue 推送推理返回的图像，
+                    # 视频流始终使用上面推送的原始预览帧，只通过语音和 UI 文本呈现导航结果。
+                except Exception as e:
+                    if frame_counter % 100 == 0:
+                        print(f"[NAV MASTER] 推理任务结果处理失败: {e}")
+                nav_infer_task = None
+
+            # 传输新鲜度统计（每 N 秒打印）
+            if (now_t - last_stats_log_t) >= stats_window_sec:
+                if age_samples_ms:
+                    ages = sorted(age_samples_ms)
+                    p50 = ages[len(ages) // 2]
+                    p90 = ages[min(len(ages) - 1, int(len(ages) * 0.9))]
+                    p99 = ages[min(len(ages) - 1, int(len(ages) * 0.99))]
+                else:
+                    p50 = p90 = p99 = -1.0
+                print(
+                    f"[CAM-LATENCY] accepted={accepted_count}, stale_drop={stale_drop_count}, "
+                    f"queue_drop={queue_drop_count}, meta_miss={meta_miss_count}, decode_fail={decode_fail_count}, "
+                    f"rec_drop={recorder_drop_count}, viewer_drop={viewer_drop_count}, nav_ui_drop={nav_ui_drop_count}, "
+                    f"infer_drop={infer_drop_count}, "
+                    f"age_ms(p50/p90/p99)=({p50:.1f}/{p90:.1f}/{p99:.1f}), threshold={max_frame_age_ms}ms"
+                )
+                if infer_samples_ms:
+                    inf = sorted(infer_samples_ms)
+                    ip50 = inf[len(inf) // 2]
+                    ip90 = inf[min(len(inf) - 1, int(len(inf) * 0.9))]
+                    ip99 = inf[min(len(inf) - 1, int(len(inf) * 0.99))]
+                    print(
+                        f"[NAV-INFER] process_ms(p50/p90/p99)=({ip50:.1f}/{ip90:.1f}/{ip99:.1f}), samples={len(infer_samples_ms)}"
+                    )
+                accepted_count = 0
+                stale_drop_count = 0
+                queue_drop_count = 0
+                meta_miss_count = 0
+                decode_fail_count = 0
+                recorder_drop_count = 0
+                viewer_drop_count = 0
+                nav_ui_drop_count = 0
+                infer_drop_count = 0
+                age_samples_ms.clear()
+                infer_samples_ms.clear()
+                last_stats_log_t = now_t
 
             # 【托管】交给统领状态机处理画面
             if orchestrator and bgr is not None:
                 current_state = orchestrator.get_state()
-                out_img = bgr
-                try:
-                    # 红绿灯检测模式：在主线程中直接处理
-                    if current_state == "TRAFFIC_LIGHT_DETECTION":
-                        import trafficlight_detection
-                        result = trafficlight_detection.process_single_frame(bgr, ui_broadcast_callback=ui_broadcast_final)
-                        out_img = result['vis_image'] if result['vis_image'] is not None else bgr
-                    else:
-                        # 其他模式：正常的导航处理
-                        res = orchestrator.process_frame(bgr)
-                        if res.guidance_text:
-                            try:
-                                nav_tts.play_voice_text_for_nav(res.guidance_text)
-                                await ui_broadcast_final(f"[导航] {res.guidance_text}")
-                            except Exception:
-                                pass
-                        out_img = res.annotated_image if res.annotated_image is not None else bgr
-                except Exception as e:
-                    if frame_counter % 100 == 0:
-                        print(f"[NAV MASTER] 处理帧时出错: {e}")
-
-                # 广播图像
-                if camera_viewers and out_img is not None:
-                    ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                    if ok:
-                        jpeg_data = enc.tobytes()
-                        dead = []
-                        for viewer_ws in list(camera_viewers):
-                            try:
-                                await viewer_ws.send_bytes(jpeg_data)
-                            except Exception:
-                                dead.append(viewer_ws)
-                        for d in dead:
-                            camera_viewers.discard(d)
+                # 推理采用单 in-flight 模式：忙时丢推理帧，不堵主链
+                if nav_infer_task is None:
+                    try:
+                        nav_infer_task = asyncio.create_task(
+                            run_orchestrator_infer(bgr.copy(), current_state)
+                        )
+                    except Exception as e:
+                        if frame_counter % 100 == 0:
+                            print(f"[NAV MASTER] 创建推理任务失败: {e}")
+                else:
+                    # 推理进行中：丢弃本帧（不再补原始预览，避免标注帧与原始帧交替导致闪烁）
+                    infer_drop_count += 1
                 # 已托管，进入下一帧
                 continue
 
-            # 【回退】未解码成功或无统领器时，按原始画面回传
-            if camera_viewers:
-                try:
-                    if bgr is None:
-                        arr = np.frombuffer(data, dtype=np.uint8)
-                        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                        if ok:
-                            jpeg_data = enc.tobytes()
-                            dead = []
-                            for viewer_ws in list(camera_viewers):
-                                try:
-                                    await viewer_ws.send_bytes(jpeg_data)
-                                except Exception:
-                                    dead.append(viewer_ws)
-                            for ws in dead:
-                                camera_viewers.discard(ws)
-                except Exception as e:
-                    print(f"[CAMERA] Broadcast error: {e}")
+            # 回退路径下同样异步回传，避免阻塞
+            try:
+                if bgr is None:
+                    arr = np.frombuffer(data, dtype=np.uint8)
+                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    try:
+                        viewer_queue.put_nowait(bgr)
+                    except asyncio.QueueFull:
+                        viewer_drop_count += 1
+                        try:
+                            _ = viewer_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        viewer_queue.put_nowait(bgr)
+            except Exception as e:
+                print(f"[CAMERA] Broadcast enqueue error: {e}")
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[CAMERA ERROR] {e}")
     finally:
+        if ENABLE_RECORDER and recorder_queue is not None:
+            try:
+                recorder_queue.put_nowait(None)
+            except Exception:
+                pass
+        try:
+            viewer_queue.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            nav_ui_queue.put_nowait(None)
+        except Exception:
+            pass
         drain_task.cancel()
         try:
             await drain_task
@@ -1315,6 +1687,24 @@ async def ws_camera_esp(ws: WebSocket):
             pass
         except Exception:
             pass
+        for t in (recorder_task, viewer_task, nav_ui_task):
+            if t is None:
+                continue
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        if nav_infer_task is not None:
+            nav_infer_task.cancel()
+            try:
+                await nav_infer_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
         try:
             if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)
@@ -1568,8 +1958,11 @@ def get_camera_ws():
     return esp32_camera_ws
 
 if __name__ == "__main__":
+    # 工业级稳定：放宽 WebSocket ping 超时，避免 ESP32 分块发送时暂时无法回 pong 被误判断连
     uvicorn.run(
         app, host="172.20.10.10", port=8081,
         log_level="warning", access_log=False,
-        loop="asyncio", workers=1, reload=False
+        loop="asyncio", workers=1, reload=False,
+        ws_ping_interval=25.0,
+        ws_ping_timeout=45.0,
     )
