@@ -157,8 +157,14 @@ from asr_core import (
     set_current_recognition,
     stop_current_recognition,
 )
-from audio_player import initialize_audio_system, play_voice_text, play_audio_threadsafe
-from cloud_nav_tts import synth_nav_tts_and_enqueue
+from audio_player import (
+    initialize_audio_system,
+    play_voice_text,
+    play_audio_threadsafe,
+    set_tts_forwarder,
+    _tts_forward_only as TTS_FORWARD_ONLY,
+    _translate_for_mobile,
+)
 
 # ---- 同步录制器（默认关闭，可用环境变量开启） ----
 # AIGLASS_ENABLE_RECORDER=1 开启；否则不启动录制，也不写入磁盘
@@ -188,6 +194,8 @@ camera_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+mobile_nav_clients: Set[WebSocket] = set()
+main_loop_for_mobile_tts: Optional[asyncio.AbstractEventLoop] = None
 
 # 【新增】盲道 / 可通行区域导航相关全局变量
 blind_path_navigator = None
@@ -467,6 +475,93 @@ async def ui_broadcast_final_no_log(text: str):
         recent_finals = recent_finals[-RECENT_MAX:]
     await ui_broadcast_raw("FINAL:" + text)
 
+
+async def mobile_tts_broadcast(
+    text: str,
+    *,
+    source: str = "server",
+    channel: str = "server_tts",
+    priority: int = 50,
+    interrupt: bool = False,
+    dedupe_key: Optional[str] = None,
+):
+    """将服务端TTS事件通过 /ws/mobile-nav 下发给 iPhone。"""
+    if not text:
+        return
+    en_text = _translate_for_mobile(text)
+    payload = {
+        "type": "tts_event",
+        "channel": channel,
+        "source": source,
+        "text": en_text,
+        "priority": int(priority),
+        "interrupt": bool(interrupt),
+        "timestamp": int(time.time() * 1000),
+        "dedupe_key": dedupe_key or en_text.strip().lower(),
+    }
+    msg = "TTS_EVENT:" + json.dumps(payload, ensure_ascii=False)
+    dead = []
+    for ws in list(mobile_nav_clients):
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        mobile_nav_clients.discard(ws)
+    if mobile_nav_clients:
+        try:
+            await ui_broadcast_raw("MOBILE_TTS:" + text)
+        except Exception:
+            pass
+
+
+async def mobile_nav_command_broadcast(prefix: str, payload: Dict[str, Any]):
+    """通过 /ws/mobile-nav 下发地图导航指令给 iPhone。
+
+    iPhone 端约定：
+      - NAV_START:{ destination: string }
+      - NAV_STOP:{ reason?: string }
+    """
+    if not prefix:
+        return
+    msg = f"{prefix}:" + json.dumps(payload, ensure_ascii=False)
+    dead = []
+    for ws in list(mobile_nav_clients):
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        mobile_nav_clients.discard(ws)
+
+
+def _audio_tts_forwarder(payload: Dict[str, Any]) -> None:
+    """
+    音频模块线程回调：把 play_voice_text 事件安全转发到主事件循环，
+    由 iPhone 端调度中心统一播报。
+    """
+    global main_loop_for_mobile_tts
+    loop = main_loop_for_mobile_tts
+    if loop is None or loop.is_closed():
+        return
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(
+            mobile_tts_broadcast(
+                text,
+                source=str(payload.get("source") or "server"),
+                channel=str(payload.get("channel") or "server_tts"),
+                priority=int(payload.get("priority") or 50),
+                interrupt=bool(payload.get("interrupt") or False),
+                dedupe_key=str(payload.get("resolved_key") or payload.get("dedupe_key") or ""),
+            ),
+            loop,
+        )
+    except Exception:
+        pass
+
 async def full_system_reset(reason: str = ""):
     """
     回到刚启动后的状态：
@@ -504,54 +599,52 @@ async def full_system_reset(reason: str = ""):
 
 
 async def start_map_navigation(destination: str):
-    """请求步行路线并开启地图导航播报轮询（高德/谷歌）。"""
+    """地图导航（地图路线规划/播报）已迁移到 iPhone 端。
+
+    服务端此处仅负责：
+    - 广播目的地名称：iPhone 端 geocode + 步行路线规划 + 绘制 + 本地导航播报
+    - 接收 iPhone 的 NAV_STOP（由语音 stop 或到达触发时发回）
+    """
     global map_nav_route, map_nav_polyline, map_nav_active, map_nav_destination_text
-    global map_match_index, map_match_s, off_route_count, last_replan_time_ms
-    global last_amap_spoken, last_amap_spoken_time, last_amap_step_index, map_nav_poll_task
-    global latest_user_position
-    key = get_navigation_api_key()
-    if not key:
-        play_voice_text("Please set AMAP_WEB_SERVICE_KEY or GOOGLE_MAPS_API_KEY for map navigation.")
-        return
-    if not latest_user_position:
-        play_voice_text("Please send your location from the phone first.")
-        return
-    lng, lat = latest_user_position
-    origin = (lng, lat)
-    dest_coord = None
-    if re.match(r"^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$", destination.strip()):
-        parts = destination.strip().split(",")
-        dest_coord = (float(parts[0].strip()), float(parts[1].strip()))
-    else:
-        dest_coord = await geocode_address(destination, key)
-    if not dest_coord:
-        play_voice_text("Could not find the destination. Check address or network.")
-        return
-    provider = get_navigation_provider()
-    if provider == "amap":
-        origin = wgs84_to_gcj02(lng, lat)
-    route = await get_walking_route(origin, dest_coord, key)
-    if not route or not route.steps:
-        play_voice_text("No walking route found.")
-        return
-    poly = precompute_route_polyline(route)
-    map_nav_route = route
-    map_nav_polyline = poly
+    global map_nav_poll_task
+
+    # 取消旧的地图匹配轮询（如果之前还跑着）
+    if map_nav_poll_task is not None and not map_nav_poll_task.done():
+        try:
+            map_nav_poll_task.cancel()
+        except Exception:
+            pass
+
+    map_nav_route = None
+    map_nav_polyline = None
     map_nav_active = True
     map_nav_destination_text = destination
-    nav_tts.set_map_nav_active(True)
-    map_match_index = 0
-    map_match_s = 0.0
-    off_route_count = 0
-    last_replan_time_ms = time.time() * 1000
-    last_amap_spoken = ""
-    last_amap_spoken_time = 0.0
-    last_amap_step_index = 0
-    # 地图导航播报改为云端：仅推送文本给前端/手机，由云端TTS负责播放
+
+    try:
+        await mobile_nav_command_broadcast("NAV_START", {"destination": destination})
+    except Exception:
+        pass
+
+    # 保留一条 UI 提示（语音由 iPhone 负责，避免服务端依赖手机位置）
     await ui_broadcast_final(f"[MAP] Start navigate to {destination}.")
-    if map_nav_poll_task is None or map_nav_poll_task.done():
-        map_nav_poll_task = asyncio.create_task(_map_nav_poll_loop())
-    print(f"[MAP_NAV] Started to {destination}, steps={len(route.steps)}")
+    try:
+        nav_tts.set_map_nav_active(True)
+    except Exception:
+        pass
+
+
+async def _interrupt_chat_playback_for_navigation(reason: str) -> None:
+    """进入导航相关模式前，立刻打断 chat/omni 播报，避免语音重叠。"""
+    global omni_conversation_active, omni_previous_nav_state
+    if not omni_conversation_active:
+        return
+    omni_conversation_active = False
+    omni_previous_nav_state = None
+    try:
+        await hard_reset_audio(reason)
+        print(f"[OMNI] interrupted by navigation command: {reason}")
+    except Exception as e:
+        print(f"[OMNI] failed to interrupt chat playback: {e}")
 
 
 async def _map_nav_poll_loop():
@@ -636,18 +729,29 @@ async def _map_nav_poll_loop():
                 if cur_state in ("CROSSING", "WAIT_TRAFFIC_LIGHT", "TRAFFIC_LIGHT_DETECTION"):
                     continue
 
-            # 使用 Qwen 云端 TTS 合成，并放入统一音频队列
+            # 统一下发到 iPhone 端 TTS 调度中心（服务端不本地播报）
             try:
-                await synth_nav_tts_and_enqueue(result.text)
+                await mobile_tts_broadcast(
+                    result.text,
+                    source="navigation",
+                    channel="navigation",
+                    priority=120,
+                    interrupt=False,
+                    dedupe_key=f"map_step_{result.step_index}_{result.kind or ''}",
+                )
                 nav_tts.mark_map_speech()
             except Exception as e:
-                print(f"[MAP_NAV] cloud TTS failed: {e}")
+                print(f"[MAP_NAV] mobile TTS push failed: {e}")
 
             if result.kind == "arrived":
                 map_nav_active = False
                 map_nav_route = None
                 map_nav_polyline = None
                 nav_tts.set_map_nav_active(False)
+                try:
+                    await mobile_nav_command_broadcast("NAV_STOP", {"reason": "arrived"})
+                except Exception:
+                    pass
                 await ui_broadcast_final("[MAP] You have arrived at your destination.")
                 return
         except asyncio.CancelledError:
@@ -694,6 +798,7 @@ async def start_ai_with_text_custom(user_text: str):
     
     # English: crossing commands
     if "start crossing" in text_lower or "help me cross" in text_lower:
+        await _interrupt_chat_playback_for_navigation("start_crossing")
         if orchestrator:
             orchestrator.start_crossing()
             print(f"[CROSS_STREET] crossing mode started, state: {orchestrator.get_state()}")
@@ -717,6 +822,7 @@ async def start_ai_with_text_custom(user_text: str):
     
     # 【兼容旧中文】检查是否是过马路相关命令 - 使用orchestrator控制
     if "开始过马路" in user_text or "帮我过马路" in user_text:
+        await _interrupt_chat_playback_for_navigation("start_crossing_zh")
         if orchestrator:
             orchestrator.start_crossing()
             print(f"[CROSS_STREET] 过马路模式已启动，状态: {orchestrator.get_state()}")
@@ -742,6 +848,7 @@ async def start_ai_with_text_custom(user_text: str):
     
     # English: traffic light detection commands
     if "start traffic light" in text_lower or "check traffic light" in text_lower:
+        await _interrupt_chat_playback_for_navigation("start_traffic_light")
         try:
             import trafficlight_detection
             
@@ -774,6 +881,7 @@ async def start_ai_with_text_custom(user_text: str):
     
     # 【兼容旧中文】检查是否是红绿灯检测命令 - 实现与盲道导航互斥
     if "检测红绿灯" in user_text or "看红绿灯" in user_text:
+        await _interrupt_chat_playback_for_navigation("start_traffic_light_zh")
         try:
             import trafficlight_detection
             
@@ -811,10 +919,7 @@ async def start_ai_with_text_custom(user_text: str):
     # 【高德/谷歌】「导航到 XXX」：解析目的地并请求步行路线，需手机先上报位置
     dest = parse_navigation_destination(user_text or "")
     if dest:
-        if latest_user_position is None:
-            play_voice_text("Please send your location from the phone to start navigation.")
-            await ui_broadcast_final("[SYSTEM] Send location from phone (e.g. JSON with lat, lng) to start map navigation.")
-            return
+        await _interrupt_chat_playback_for_navigation("start_map_navigation")
         asyncio.create_task(start_map_navigation(dest))
         # 同时开启可通行区域导航（地图+盲道一起）
         if orchestrator:
@@ -825,6 +930,7 @@ async def start_ai_with_text_custom(user_text: str):
     
     # English: navigation commands（仅可通行区域，无目的地）
     if "start navigation" in text_lower or "blind path" in text_lower or "help me navigate" in text_lower:
+        await _interrupt_chat_playback_for_navigation("start_blind_path_navigation")
         if orchestrator:
             orchestrator.start_blind_path_navigation()
             print(f"[NAVIGATION] blind-path navigation started, state: {orchestrator.get_state()}")
@@ -846,6 +952,10 @@ async def start_ai_with_text_custom(user_text: str):
         if map_nav_active:
             map_nav_active = False
             nav_tts.set_map_nav_active(False)
+            try:
+                await mobile_nav_command_broadcast("NAV_STOP", {"reason": "voice_stop"})
+            except Exception:
+                pass
             play_voice_text("Map navigation stopped.")
         return
     
@@ -885,11 +995,40 @@ async def start_ai_with_text_custom(user_text: str):
 # ========= Omni 播放启动 =========
 async def start_ai_with_text(user_text: str):
     """硬重置后，开启新的 AI 语音输出。"""
+    concise_system_prompt = (
+        "You are a concise visual assistant. "
+        "Reply in English with no more than 3 short sentences. "
+        "Focus only on the most important visible facts."
+    )
     async def _runner():
         txt_buf: List[str] = []
         rate_state = None
+        _sentence_buf: List[str] = []  # 用于按句转发到 iPhone
 
-        # 组装（图像+文本）
+        async def _flush_sentence_to_mobile(force: bool = False):
+            """将累积文本按句发给 iPhone TTS 调度中心。"""
+            raw = "".join(_sentence_buf).strip()
+            if not raw:
+                return
+            import re as _re
+            sents = _re.split(r'(?<=[.?!。？！])\s*', raw)
+            complete = sents[:-1] if not force else sents
+            leftover = sents[-1] if not force and sents else ""
+            for s in complete:
+                s = s.strip()
+                if not s:
+                    continue
+                await mobile_tts_broadcast(
+                    s,
+                    source="omni_chat",
+                    channel="server_tts",
+                    priority=90,
+                    interrupt=False,
+                )
+            _sentence_buf.clear()
+            if leftover:
+                _sentence_buf.append(leftover)
+
         content_list = []
         if last_frames:
             try:
@@ -903,31 +1042,40 @@ async def start_ai_with_text(user_text: str):
                 pass
         content_list.append({"type": "text", "text": user_text})
 
+        forward_to_phone = TTS_FORWARD_ONLY and bool(mobile_nav_clients)
+
         try:
-            async for piece in stream_chat(content_list, voice="Cherry", audio_format="wav"):
-                # 文本增量（仅 UI）
+            async for piece in stream_chat(
+                content_list,
+                voice="Cherry",
+                audio_format="wav",
+                system_prompt=concise_system_prompt,
+            ):
                 if piece.text_delta:
                     txt_buf.append(piece.text_delta)
+                    if forward_to_phone:
+                        _sentence_buf.append(piece.text_delta)
+                        await _flush_sentence_to_mobile(force=False)
                     try:
                         await ui_broadcast_partial("[AI] " + "".join(txt_buf))
                     except Exception:
                         pass
 
-                # 音频分片：Omni 返回 24k (PCM16) 的 wav audio.data（Base64）；下行需要 8k PCM16
-                if piece.audio_b64:
+                if piece.audio_b64 and not forward_to_phone:
                     try:
                         pcm24 = base64.b64decode(piece.audio_b64)
                     except Exception:
                         pcm24 = b""
                     if pcm24:
-                        # 24k → 8k (使用ratecv保证音调和速度不变)
                         pcm8k, rate_state = audioop.ratecv(pcm24, 2, 1, 24000, 8000, rate_state)
                         pcm8k = audioop.mul(pcm8k, 2, 0.60)
                         if pcm8k:
                             await broadcast_pcm16_realtime(pcm8k)
 
+            if forward_to_phone:
+                await _flush_sentence_to_mobile(force=True)
+
         except asyncio.CancelledError:
-            # 被新一轮打断
             raise
         except Exception as e:
             try:
@@ -935,11 +1083,9 @@ async def start_ai_with_text(user_text: str):
             except Exception:
                 pass
         finally:
-            # 【修改】标记omni对话结束，恢复之前的导航模式
             global omni_conversation_active, omni_previous_nav_state
             omni_conversation_active = False
             
-            # 恢复之前的导航状态
             if orchestrator and omni_previous_nav_state:
                 orchestrator.force_state(omni_previous_nav_state)
                 print(f"[OMNI] 对话结束，恢复到{omni_previous_nav_state}模式")
@@ -947,14 +1093,14 @@ async def start_ai_with_text(user_text: str):
             else:
                 print(f"[OMNI] 对话结束（无需恢复导航状态）")
             
-            # 自然结束时，给当前连接一个 "完结" 信号
-            from audio_stream import stream_clients  # 局部导入，避免环依赖
-            for sc in list(stream_clients):
-                if not sc.abort_event.is_set():
-                    try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # 一帧静音
-                    except Exception: pass
-                    try: sc.q.put_nowait(None)
-                    except Exception: pass
+            if not forward_to_phone:
+                from audio_stream import stream_clients
+                for sc in list(stream_clients):
+                    if not sc.abort_event.is_set():
+                        try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)
+                        except Exception: pass
+                        try: sc.q.put_nowait(None)
+                        except Exception: pass
 
             final_text = ("".join(txt_buf)).strip() or "（空响应）"
             try:
@@ -1163,8 +1309,24 @@ async def ws_audio(ws: WebSocket):
 async def ws_mobile_nav(ws: WebSocket):
     global latest_mobile_nav, latest_user_position, latest_user_position_accuracy
     await ws.accept()
+    mobile_nav_clients.add(ws)
     print("[MOBILE_NAV] client connected")
     try:
+        # 告知 iPhone 端：服务端会发送 TTS_EVENT，由手机侧统一调度播放
+        try:
+            await ws.send_text(
+                "TTS_CAPABILITY:" + json.dumps(
+                    {
+                        "type": "tts_capability",
+                        "version": 1,
+                        "mode": "iphone_scheduler",
+                        "channels": ["navigation", "blind_path", "obstacle", "server_tts"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception:
+            pass
         while True:
             msg = await ws.receive_text()
             raw = (msg or "").strip()
@@ -1206,6 +1368,8 @@ async def ws_mobile_nav(ws: WebSocket):
         print("[MOBILE_NAV] disconnected")
     except Exception as e:
         print(f"[MOBILE_NAV] error: {e}")
+    finally:
+        mobile_nav_clients.discard(ws)
 
 # ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
 @app.websocket("/ws/camera")
@@ -1920,6 +2084,11 @@ async def on_startup_register_bridge_sender():
 @app.on_event("startup")
 async def on_startup_init_audio():
     """启动时初始化音频系统"""
+    global main_loop_for_mobile_tts
+    main_loop_for_mobile_tts = asyncio.get_running_loop()
+    # 注册“服务端TTS事件 -> iPhone”转发器（保留服务端原有节流策略）
+    set_tts_forwarder(_audio_tts_forwarder)
+
     # 在后台线程中初始化，避免阻塞启动
     def _init():
         try:

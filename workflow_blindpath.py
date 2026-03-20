@@ -2844,9 +2844,9 @@ class BlindPathNavigator:
             elif guidance_code == "move_right":
                 guidance_text = "向右移动一点" if self.boundary_warn_state in ("warn_left",) else "稍微向右靠一点"
             elif guidance_code == "turn_left":
-                guidance_text = "请向左微调方向"
+                guidance_text = ""
             elif guidance_code == "turn_right":
-                guidance_text = "请向右微调方向"
+                guidance_text = ""
             elif guidance_code == "keep_straight":
                 guidance_text = "保持直行"
             else:

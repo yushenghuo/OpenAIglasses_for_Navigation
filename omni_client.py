@@ -28,6 +28,7 @@ async def stream_chat(
     content_list: List[Dict[str, Any]],
     voice: str = "Cherry",
     audio_format: str = "wav",
+    system_prompt: Optional[str] = None,
 ) -> AsyncGenerator[OmniStreamPiece, None]:
     """
     发起一轮 Omni-Turbo ChatCompletions 流式对话：
@@ -35,9 +36,14 @@ async def stream_chat(
     - 以 stream=True 返回
     - 增量产出：OmniStreamPiece(text_delta=?, audio_b64=?)
     """
+    messages: List[Dict[str, Any]] = []
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+    messages.append({"role": "user", "content": content_list})
+
     completion = oai_client.chat.completions.create(
         model=QWEN_MODEL,
-        messages=[{"role": "user", "content": content_list}],
+        messages=messages,
         modalities=["text", "audio"],
         audio={"voice": voice, "format": audio_format},
         stream=True,
