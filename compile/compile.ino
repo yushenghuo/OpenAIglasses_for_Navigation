@@ -40,6 +40,7 @@ framesize_t g_frame_size = FRAMESIZE_VGA;
 #define JPEG_QUALITY  26
 #define FB_COUNT      2
 volatile int g_target_fps = 12; // 新增：0=不限，>0 则按该FPS限速发送
+volatile int g_adaptive_quality = JPEG_QUALITY; // 自适应画质（数值越大压缩越强）
 
 // 【新增】视频传输性能监控
 volatile unsigned long frame_captured_count = 0;  // 采集帧计数
@@ -282,6 +283,10 @@ void taskCamSend(void*) {
   unsigned long send_timeout_count = 0;
   unsigned long last_sent_time = 0;
   int consecutive_send_fail = 0;
+  unsigned long last_adapt_time = 0;
+  unsigned long last_fail_snapshot = 0;
+  unsigned long last_drop_snapshot = 0;
+  int adapt_level = 0; // 0=正常, 1=轻度降载, 2=重度降载
   
   for(;;){
     CamFrameItem item;
@@ -305,8 +310,8 @@ void taskCamSend(void*) {
         unsigned long send_start = millis();
         bool ok = false;
         bool timeout_abort = false;
-        // 小块发送：单次 sendBinary 阻塞更短，超时检查更频繁，单次卡顿控制在 ~500ms 内
-        const unsigned long SEND_TIMEOUT_MS = 500;
+        // 小块发送：单次 sendBinary 阻塞更短，超时检查更频繁；正常约 100~200ms，超过则视为卡顿
+        const unsigned long SEND_TIMEOUT_MS = 250;
         const size_t CHUNK = 512;
         wsCam.poll();
         String meta = "META:" + String(item.frame_id) + ":" + String(item.t_capture_ms) + ":" + String(fb->len);
@@ -317,6 +322,8 @@ void taskCamSend(void*) {
         if (meta_ok) {
           ok = true;
           for (size_t off = 0; off < (size_t)fb->len && ok; off += CHUNK) {
+            // 注意：不要用「队列非空」作为抢占条件——采集通常快于发送，队列几乎总有 1 帧在等待，
+            // 会导致每帧在第一个分片就被中止。新帧优先已由 enqueue_frame 满队列丢旧 + 浅队列保证。
             if (millis() - send_start > SEND_TIMEOUT_MS) {
               wsCam.send("DROP:" + String(item.frame_id));
               ok = false;
@@ -349,7 +356,7 @@ void taskCamSend(void*) {
             Serial.printf("[CAM-SEND] ERROR: send failed (meta_ok=%d), consec_fail=%d\n", meta_ok ? 1 : 0, consecutive_send_fail);
           } else {
             consecutive_send_fail = 0;
-            Serial.printf("[CAM-SEND] timeout %lu ms, drop frame (size=%u)\n", send_time, fb->len);
+            Serial.printf("[CAM-SEND] send stalled >%lums, drop frame (size=%u)\n", SEND_TIMEOUT_MS, fb->len);
           }
           esp_camera_fb_return(fb);
           // 瞬时失败不立刻断线，避免频繁重连导致 1~2s 卡顿
@@ -384,6 +391,39 @@ void taskCamSend(void*) {
           Serial.printf("[CAM-SEND] sent=%lu, meta=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n", 
                         frame_sent_count, frame_meta_sent_count, frame_dropped_count, ws_send_fail_count, gap);
           last_log = now;
+        }
+
+        // 发送端自适应降载：失败/丢帧上升时，自动降低FPS并提高压缩
+        if (now - last_adapt_time > 5000) {
+          unsigned long fail_delta = ws_send_fail_count - last_fail_snapshot;
+          unsigned long drop_delta = frame_dropped_count - last_drop_snapshot;
+          last_fail_snapshot = ws_send_fail_count;
+          last_drop_snapshot = frame_dropped_count;
+          last_adapt_time = now;
+
+          int prev_level = adapt_level;
+          if (fail_delta >= 6 || drop_delta >= 20 || send_timeout_count >= 3) {
+            if (adapt_level < 2) adapt_level++;
+          } else if (fail_delta == 0 && drop_delta < 5 && send_timeout_count == 0) {
+            if (adapt_level > 0) adapt_level--;
+          }
+
+          send_timeout_count = 0;
+
+          // level -> 发送参数
+          int target_fps_new = 12;
+          int quality_new = JPEG_QUALITY;
+          if (adapt_level == 1) { target_fps_new = 10; quality_new = 30; }
+          if (adapt_level == 2) { target_fps_new = 8;  quality_new = 34; }
+
+          if (adapt_level != prev_level || g_target_fps != target_fps_new || g_adaptive_quality != quality_new) {
+            g_target_fps = target_fps_new;
+            g_adaptive_quality = quality_new;
+            sensor_t* s = esp_camera_sensor_get();
+            if (s) s->set_quality(s, g_adaptive_quality);
+            Serial.printf("[CAM-SEND][ADAPT] level=%d fps=%d quality=%d fail_delta=%lu drop_delta=%lu\n",
+                          adapt_level, g_target_fps, g_adaptive_quality, fail_delta, drop_delta);
+          }
         }
         
       } else if (fb) { 
