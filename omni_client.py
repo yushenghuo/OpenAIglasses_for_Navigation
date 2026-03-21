@@ -29,6 +29,8 @@ async def stream_chat(
     voice: str = "Cherry",
     audio_format: str = "wav",
     system_prompt: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
 ) -> AsyncGenerator[OmniStreamPiece, None]:
     """
     发起一轮 Omni-Turbo ChatCompletions 流式对话：
@@ -41,11 +43,18 @@ async def stream_chat(
         messages.append({"role": "system", "content": system_prompt.strip()})
     messages.append({"role": "user", "content": content_list})
 
+    if max_tokens is None:
+        max_tokens = int(os.getenv("AIGLASS_CHAT_MAX_TOKENS", "120"))
+    if temperature is None:
+        temperature = float(os.getenv("AIGLASS_CHAT_TEMPERATURE", "0.2"))
+
     completion = oai_client.chat.completions.create(
         model=QWEN_MODEL,
         messages=messages,
         modalities=["text", "audio"],
         audio={"voice": voice, "format": audio_format},
+        max_tokens=max_tokens,
+        temperature=temperature,
         stream=True,
         stream_options={"include_usage": True},
     )

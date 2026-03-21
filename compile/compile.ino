@@ -11,6 +11,7 @@
 #include "freertos/queue.h"
 struct WavFmt;
 #include <cstring>      // memcmp
+#include <stdlib.h>     // malloc/free（UDP 相机拷贝）
 #include <WiFiUdp.h>
 #include <WiFiClient.h> 
 #include <SPI.h>        // <<< 改成 SPI
@@ -25,6 +26,18 @@ const char* WIFI_SSID   = "Yusheng iPhone";
 const char* WIFI_PASS   = "518815518";
 const char* SERVER_HOST = "172.20.10.10";
 const uint16_t SERVER_PORT = 8081;
+
+// ===== 相机：1=仅 UDP（关闭相机 WebSocket）；0=WebSocket /ws/camera（与 app AIGLASS_CAMERA_UDP 一致）=====
+#define CAMERA_USE_UDP_ONLY     1
+#if CAMERA_USE_UDP_ONLY
+#define ENABLE_CAMERA_UDP       1
+#else
+#define ENABLE_CAMERA_UDP       0
+#endif
+#define CAM_UDP_PORT            18500
+#define CAM_UDP_CHUNK_PAYLOAD   1024
+#define CAM_UDP_TARGET_FPS      12
+#define UDP_DROP_IF_SENDING_QUEUED  1
 
 // 设为 0：语音不下发到眼镜，由手机连接 /stream_phone.wav 播放；设为 1：保持原样，眼镜扬声器播放
 #define ENABLE_TTS_PLAYBACK 0
@@ -51,6 +64,36 @@ volatile unsigned long ws_send_fail_count = 0;    // WebSocket发送失败计数
 volatile unsigned long frame_meta_sent_count = 0; // 元信息发送计数
 volatile unsigned long frame_seq_id = 0;          // 帧序号（单调递增）
 
+#if ENABLE_CAMERA_UDP
+typedef struct {
+  uint8_t* buf;
+  size_t len;
+  uint16_t frame_id;
+} CamUdpItem;
+QueueHandle_t qUdpFrames;
+WiFiUDP udpCam;
+volatile bool cam_udp_send_busy = false;
+volatile unsigned long udp_frame_sent_count = 0;
+volatile unsigned long udp_queue_replaced_count = 0;
+volatile unsigned long udp_drop_busy_count = 0;
+volatile unsigned long udp_malloc_fail_count = 0;
+static uint16_t udp_frame_seq_16 = 0;
+
+void enqueue_udp_replace(CamUdpItem* item) {
+  CamUdpItem old;
+  memset(&old, 0, sizeof(old));
+  if (xQueueSend(qUdpFrames, item, 0) != pdPASS) {
+    if (xQueueReceive(qUdpFrames, &old, 0) == pdPASS) {
+      if (old.buf) {
+        free(old.buf);
+        udp_queue_replaced_count++;
+      }
+    }
+    xQueueSend(qUdpFrames, item, 0);
+  }
+}
+#endif
+
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
 #define I2S_MIC_DATA_PIN  41
@@ -76,7 +119,7 @@ const int TTS_RATE = 16000;
 const char* UDP_HOST  = "47.100.161.139";
 const int   UDP_PORT  = 12345;
 
-WiFiUDP udp;
+WiFiUDP udp;  // IMU 等
 
 // ===== OMI 电池管理相关常量（仅在 OMI Glass 变体下启用） =====
 #if HW_VARIANT_OMI_GLASS
@@ -237,46 +280,161 @@ inline void enqueue_frame(camera_fb_t* fb, uint32_t frame_id, uint32_t t_capture
   }
 }
 
+#if ENABLE_CAMERA_UDP
+void taskCamUdpSend(void*) {
+  CamUdpItem item;
+  memset(&item, 0, sizeof(item));
+  unsigned long last_log = 0;
+
+  for (;;) {
+    if (xQueueReceive(qUdpFrames, &item, portMAX_DELAY) != pdPASS) continue;
+    if (!item.buf || item.len == 0) continue;
+
+    cam_udp_send_busy = true;
+    size_t total = (item.len + CAM_UDP_CHUNK_PAYLOAD - 1) / CAM_UDP_CHUNK_PAYLOAD;
+    if (total == 0 || total > 65535u) {
+      free(item.buf);
+      cam_udp_send_busy = false;
+      continue;
+    }
+    uint16_t total_chunks = (uint16_t)total;
+    bool ok = true;
+    for (size_t ci = 0; ci < total && ok; ci++) {
+      size_t off = ci * CAM_UDP_CHUNK_PAYLOAD;
+      size_t n = item.len - off;
+      if (n > CAM_UDP_CHUNK_PAYLOAD) n = CAM_UDP_CHUNK_PAYLOAD;
+
+      uint8_t pkt[6 + CAM_UDP_CHUNK_PAYLOAD];
+      uint16_t chunk_id = (uint16_t)ci;
+      memcpy(pkt, &item.frame_id, 2);
+      memcpy(pkt + 2, &chunk_id, 2);
+      memcpy(pkt + 4, &total_chunks, 2);
+      memcpy(pkt + 6, item.buf + off, n);
+
+      if (!udpCam.beginPacket(SERVER_HOST, CAM_UDP_PORT)) {
+        ok = false;
+        break;
+      }
+      size_t w = udpCam.write(pkt, 6 + n);
+      if (w != 6 + n) {
+        ok = false;
+        break;
+      }
+      if (!udpCam.endPacket()) {
+        ok = false;
+        break;
+      }
+      yield();
+    }
+    free(item.buf);
+    item.buf = nullptr;
+    cam_udp_send_busy = false;
+    if (ok) udp_frame_sent_count++;
+
+    unsigned long now = millis();
+    if (now - last_log > 5000) {
+      Serial.printf("[CAM-UDP] sent=%lu, q_replace=%lu, drop_busy=%lu, malloc_fail=%lu\n",
+                    udp_frame_sent_count, udp_queue_replaced_count, udp_drop_busy_count, udp_malloc_fail_count);
+      last_log = now;
+    }
+  }
+}
+#endif
+
 void taskCamCapture(void*) {
   unsigned long last_log = 0;
   unsigned long capture_fail_count = 0;
-  
+#if ENABLE_CAMERA_UDP
+  unsigned long last_udp_enqueue_ms = 0;
+  const unsigned long udp_period_ms = 1000UL / (unsigned long)CAM_UDP_TARGET_FPS;
+#endif
+
   for(;;){
     if (snapshot_in_progress) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-    
-    if (cam_ws_ready) {
-      camera_fb_t* fb = esp_camera_fb_get();
-      if (fb) {
-        frame_captured_count++;
-        uint32_t capture_ms = (uint32_t)millis();
-        uint32_t frame_id = (uint32_t)(++frame_seq_id);
-        if (fb->format != PIXFORMAT_JPEG) { 
-          esp_camera_fb_return(fb);
-          capture_fail_count++;
-        }
-        else { 
-          enqueue_frame(fb, frame_id, capture_ms);
-        }
-      } else {
-        capture_fail_count++;
-        vTaskDelay(pdMS_TO_TICKS(2));
+
+    bool want_ws = cam_ws_ready;
+    bool want_udp = false;
+#if ENABLE_CAMERA_UDP
+    want_udp = (WiFi.status() == WL_CONNECTED);
+#endif
+    if (!want_ws && !want_udp) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+#if ENABLE_CAMERA_UDP
+    if (want_udp && !want_ws) {
+      if ((millis() - last_udp_enqueue_ms) < udp_period_ms) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        continue;
       }
-      
-      // 每5秒打印一次采集统计
-      unsigned long now = millis();
-      if (now - last_log > 5000) {
-        int queue_waiting = uxQueueMessagesWaiting(qFrames);
-        Serial.printf("[CAM-CAP] captured=%lu, queue=%d, fail=%lu\n", 
-                      frame_captured_count, queue_waiting, capture_fail_count);
-        last_log = now;
-        capture_fail_count = 0;  // 重置失败计数
+    }
+#endif
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      frame_captured_count++;
+      uint32_t capture_ms = (uint32_t)millis();
+      uint32_t frame_id = (uint32_t)(++frame_seq_id);
+      if (fb->format != PIXFORMAT_JPEG) {
+        esp_camera_fb_return(fb);
+        capture_fail_count++;
+      } else {
+#if ENABLE_CAMERA_UDP
+        bool do_udp = want_udp;
+        if (do_udp && want_ws) {
+          do_udp = ((millis() - last_udp_enqueue_ms) >= udp_period_ms);
+        }
+#if UDP_DROP_IF_SENDING_QUEUED
+        if (do_udp && cam_udp_send_busy && uxQueueMessagesWaiting(qUdpFrames) > 0) {
+          do_udp = false;
+          udp_drop_busy_count++;
+        }
+#endif
+        if (do_udp) {
+          uint8_t* copy = (uint8_t*)malloc(fb->len);
+          if (copy) {
+            memcpy(copy, fb->buf, fb->len);
+            CamUdpItem uitem;
+            uitem.buf = copy;
+            uitem.len = fb->len;
+            uitem.frame_id = (uint16_t)(++udp_frame_seq_16);
+            enqueue_udp_replace(&uitem);
+            last_udp_enqueue_ms = millis();
+          } else {
+            udp_malloc_fail_count++;
+          }
+        }
+#endif
+        if (want_ws) {
+          enqueue_frame(fb, frame_id, capture_ms);
+        } else {
+          esp_camera_fb_return(fb);
+        }
       }
     } else {
-      vTaskDelay(pdMS_TO_TICKS(20));
+      capture_fail_count++;
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    unsigned long now = millis();
+    if (now - last_log > 5000) {
+      int queue_waiting = uxQueueMessagesWaiting(qFrames);
+#if ENABLE_CAMERA_UDP
+      int uq = uxQueueMessagesWaiting(qUdpFrames);
+      Serial.printf("[CAM-CAP] captured=%lu, ws_q=%d, udp_q=%d, fail=%lu\n",
+                    frame_captured_count, queue_waiting, uq, capture_fail_count);
+#else
+      Serial.printf("[CAM-CAP] captured=%lu, queue=%d, fail=%lu\n",
+                    frame_captured_count, queue_waiting, capture_fail_count);
+#endif
+      last_log = now;
+      capture_fail_count = 0;
     }
   }
 }
 
+#if !CAMERA_USE_UDP_ONLY
 void taskCamSend(void*) {
   static TickType_t lastTick = 0;
   unsigned long last_log = 0;
@@ -442,6 +600,7 @@ void taskCamSend(void*) {
     }
   }
 }
+#endif // !CAMERA_USE_UDP_ONLY
 // ====================================================================
 // Mic (PDM RX)
 // ====================================================================
@@ -499,7 +658,7 @@ void taskWsService(void*){
   for(;;){
     unsigned long now = millis();
 
-    // camera ws reconnect (non-blocking cadence)
+#if !CAMERA_USE_UDP_ONLY
     if (!wsCam.available() && (now - last_cam_reconnect_ms >= 500)) {
       last_cam_reconnect_ms = now;
       if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
@@ -508,6 +667,7 @@ void taskWsService(void*){
         Serial.println("[WS-CAM] reconnect pending...");
       }
     }
+#endif
 
     // audio ws reconnect (non-blocking cadence)
     if (!wsAud.available() && (now - last_aud_reconnect_ms >= 1000)) {
@@ -1150,8 +1310,10 @@ void shutdownDevice() {
   run_audio_stream = false;
 
   // 关闭 WebSocket 连接
+#if !CAMERA_USE_UDP_ONLY
   wsCam.close();
   cam_ws_ready = false;
+#endif
   wsAud.close();
   aud_ws_ready = false;
 
@@ -1179,8 +1341,10 @@ void readBatteryLevel() {}
 void shutdownDevice() {
   Serial.println("[POWER] Long press -> deep sleep (dev board)");
   run_audio_stream = false;
+#if !CAMERA_USE_UDP_ONLY
   wsCam.close();
   cam_ws_ready = false;
+#endif
   wsAud.close();
   aud_ws_ready = false;
   // 不配置任何外部唤醒源，避免被同一个按键/噪声立刻唤醒
@@ -1354,11 +1518,25 @@ void setup() {
 #endif
 
   qFrames = xQueueCreate(2, sizeof(CamFrameItem));  // 小队列+丢旧帧，优先最新画面
+#if ENABLE_CAMERA_UDP
+  qUdpFrames = xQueueCreate(1, sizeof(CamUdpItem));
+  if (!udpCam.begin(0)) {
+    Serial.println("[CAM-UDP] udpCam.begin(0) failed");
+  } else {
+    Serial.printf("[CAM-UDP] -> %s:%u chunk=%u fps~%d\n",
+                  SERVER_HOST, (unsigned)CAM_UDP_PORT, (unsigned)CAM_UDP_CHUNK_PAYLOAD, CAM_UDP_TARGET_FPS);
+  }
+#endif
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
 
   xTaskCreatePinnedToCore(taskCamCapture, "cam_cap", 10240, NULL, 4, NULL, 1);
+#if ENABLE_CAMERA_UDP
+  xTaskCreatePinnedToCore(taskCamUdpSend, "cam_udp", 8192, NULL, 3, NULL, 1);
+#endif
+#if !CAMERA_USE_UDP_ONLY
   xTaskCreatePinnedToCore(taskCamSend,    "cam_snd",  8192, NULL, 3, NULL, 1);
+#endif
   xTaskCreatePinnedToCore(taskWsService,  "ws_svc",   6144, NULL, 3, NULL, 0);
   xTaskCreatePinnedToCore(taskMicCapture, "mic_cap",   4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(taskMicUpload,  "mic_upl",   4096, NULL, 2, NULL, 1);
@@ -1371,6 +1549,7 @@ void setup() {
   xTaskCreatePinnedToCore(taskTTSPlay,    "tts_play",  4096, NULL, 2, NULL, 0);
 #endif
 
+#if !CAMERA_USE_UDP_ONLY
   wsCam.onEvent([](WebsocketsEvent ev, String){
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
       cam_ws_ready = true;  
@@ -1447,6 +1626,9 @@ void setup() {
       }
     }
   });
+#else
+  Serial.println("[CAM] WebSocket camera disabled (CAMERA_USE_UDP_ONLY=1)");
+#endif
 
   wsAud.onEvent([](WebsocketsEvent ev, String){
     if (ev == WebsocketsEvent::ConnectionOpened)  { aud_ws_ready = true;  Serial.println("[WS-AUD] open"); }
