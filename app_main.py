@@ -66,7 +66,7 @@ from maps_navigation import (
 from navigation_destination import parse_navigation_destination
 import nav_tts
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -81,11 +81,6 @@ from device_utils import get_device
 
 import bridge_io
 import threading
-from camera_udp_ingest import start_udp_camera_listener
-
-# 1=相机走 UDP（与固件 CAMERA_USE_UDP_ONLY=1 一致）；0=仅 WebSocket /ws/camera
-CAMERA_UDP_ENABLED = os.getenv("AIGLASS_CAMERA_UDP", "1").strip().lower() in ("1", "true", "yes", "on")
-camera_pipeline_running = False
 # ---- Windows 事件循环策略 ----
 if sys.platform.startswith("win"):
     try:
@@ -203,20 +198,13 @@ esp32_audio_ws: Optional[WebSocket] = None
 mobile_nav_clients: Set[WebSocket] = set()
 main_loop_for_mobile_tts: Optional[asyncio.AbstractEventLoop] = None
 
-# 对话后端：国内=Qwen-Omni（阿里云），国外=Gemini（Google）。可被 /api/chat-region 覆盖。
-chat_region_override: Optional[str] = None  # None 表示使用环境变量 AIGLASS_CHAT_REGION
-
 
 def get_chat_region() -> str:
-    """返回 china（Qwen）或 international（Gemini）。"""
-    global chat_region_override
-    if chat_region_override in ("china", "international"):
-        return chat_region_override
+    """china -> Qwen, international -> Gemini."""
     v = os.getenv("AIGLASS_CHAT_REGION", "china").strip().lower()
     if v in ("international", "overseas", "global", "gemini", "foreign", "国外"):
         return "international"
     return "china"
-
 
 # 【新增】盲道 / 可通行区域导航相关全局变量
 blind_path_navigator = None
@@ -654,20 +642,6 @@ async def start_map_navigation(destination: str):
         pass
 
 
-async def _interrupt_chat_playback_for_navigation(reason: str) -> None:
-    """进入导航相关模式前，立刻打断 chat/omni 播报，避免语音重叠。"""
-    global omni_conversation_active, omni_previous_nav_state
-    if not omni_conversation_active:
-        return
-    omni_conversation_active = False
-    omni_previous_nav_state = None
-    try:
-        await hard_reset_audio(reason)
-        print(f"[OMNI] interrupted by navigation command: {reason}")
-    except Exception as e:
-        print(f"[OMNI] failed to interrupt chat playback: {e}")
-
-
 async def _map_nav_poll_loop():
     """轮询：用最新位置做 map matching + 指令播报 + 偏离重规划。"""
     global map_nav_route, map_nav_polyline, map_nav_active, map_match_index, map_match_s
@@ -819,7 +793,6 @@ async def start_ai_with_text_custom(user_text: str):
     
     # English: crossing commands
     if "start crossing" in text_lower or "help me cross" in text_lower:
-        await _interrupt_chat_playback_for_navigation("start_crossing")
         if orchestrator:
             orchestrator.start_crossing()
             print(f"[CROSS_STREET] crossing mode started, state: {orchestrator.get_state()}")
@@ -843,7 +816,6 @@ async def start_ai_with_text_custom(user_text: str):
     
     # 【兼容旧中文】检查是否是过马路相关命令 - 使用orchestrator控制
     if "开始过马路" in user_text or "帮我过马路" in user_text:
-        await _interrupt_chat_playback_for_navigation("start_crossing_zh")
         if orchestrator:
             orchestrator.start_crossing()
             print(f"[CROSS_STREET] 过马路模式已启动，状态: {orchestrator.get_state()}")
@@ -869,7 +841,6 @@ async def start_ai_with_text_custom(user_text: str):
     
     # English: traffic light detection commands
     if "start traffic light" in text_lower or "check traffic light" in text_lower:
-        await _interrupt_chat_playback_for_navigation("start_traffic_light")
         try:
             import trafficlight_detection
             
@@ -902,7 +873,6 @@ async def start_ai_with_text_custom(user_text: str):
     
     # 【兼容旧中文】检查是否是红绿灯检测命令 - 实现与盲道导航互斥
     if "检测红绿灯" in user_text or "看红绿灯" in user_text:
-        await _interrupt_chat_playback_for_navigation("start_traffic_light_zh")
         try:
             import trafficlight_detection
             
@@ -940,7 +910,6 @@ async def start_ai_with_text_custom(user_text: str):
     # 【高德/谷歌】「导航到 XXX」：解析目的地并请求步行路线，需手机先上报位置
     dest = parse_navigation_destination(user_text or "")
     if dest:
-        await _interrupt_chat_playback_for_navigation("start_map_navigation")
         asyncio.create_task(start_map_navigation(dest))
         # 同时开启可通行区域导航（地图+盲道一起）
         if orchestrator:
@@ -951,7 +920,6 @@ async def start_ai_with_text_custom(user_text: str):
     
     # English: navigation commands（仅可通行区域，无目的地）
     if "start navigation" in text_lower or "blind path" in text_lower or "help me navigate" in text_lower:
-        await _interrupt_chat_playback_for_navigation("start_blind_path_navigation")
         if orchestrator:
             orchestrator.start_blind_path_navigation()
             print(f"[NAVIGATION] blind-path navigation started, state: {orchestrator.get_state()}")
@@ -1016,23 +984,15 @@ async def start_ai_with_text_custom(user_text: str):
 # ========= Omni 播放启动 =========
 async def start_ai_with_text(user_text: str):
     """硬重置后，开启新的 AI 语音输出。"""
-    brief_chars = int(os.getenv("AIGLASS_CHAT_BRIEF_CHARS", "30"))
-    # 英文与「30 个中文字」信息量大致对应：约 8～15 个英文词（不精确，仅作软约束）
-    brief_words_en = int(os.getenv("AIGLASS_CHAT_BRIEF_WORDS_EN", "12"))
     concise_system_prompt = (
         "You are a concise visual assistant for blind users. "
-        "Follow ALL constraints strictly: "
-        "1) Same language as the user's latest input; "
-        "2) Exactly ONE short sentence unless impossible, then TWO at most; "
-        f"3) If Chinese: total <= {brief_chars} characters (including punctuation); "
-        f"   If English/other Latin script: total <= {brief_words_en} words; "
-        "4) No lists, bullets, headings, prefaces, or sign-offs; "
-        "5) State only the single most important visible fact for safe navigation; "
-        "6) End with a complete sentence."
+        "Use the same language as user input. "
+        "Keep answers very short and practical."
     )
     async def _runner():
         txt_buf: List[str] = []
         rate_state = None
+        was_cancelled = False
         _sentence_buf: List[str] = []  # 用于按句转发到 iPhone
 
         async def _flush_sentence_to_mobile(force: bool = False):
@@ -1070,29 +1030,20 @@ async def start_ai_with_text(user_text: str):
                 })
             except Exception:
                 pass
-        # 仅 system 时多模态模型常「听不进去」。把关键约束再放进 user 文本前（提高遵循率，仍非 100% 精确字数）
-        user_block = (
-            f"[STYLE: blind-user, brief. "
-            f"Chinese <= {brief_chars} chars; English <= {brief_words_en} words.]\n"
-            f"{user_text}"
-        )
-        content_list.append({"type": "text", "text": user_block})
+        content_list.append({"type": "text", "text": user_text})
 
         forward_to_phone = TTS_FORWARD_ONLY and bool(mobile_nav_clients)
 
-        chat_region = get_chat_region()
-        if chat_region == "international":
-            print("[CHAT] backend=Gemini (text stream; no Omni TTS on server)", flush=True)
-        else:
-            print("[CHAT] backend=Qwen-Omni (DashScope)", flush=True)
-
         try:
+            chat_region = get_chat_region()
             if chat_region == "international":
+                print("[CHAT] backend=Gemini (AIGLASS_CHAT_REGION=international)", flush=True)
                 stream_iter = stream_chat_gemini(
                     content_list,
                     system_prompt=concise_system_prompt,
                 )
             else:
+                print("[CHAT] backend=Qwen-Omni (AIGLASS_CHAT_REGION=china)", flush=True)
                 stream_iter = stream_chat(
                     content_list,
                     voice="Cherry",
@@ -1126,6 +1077,7 @@ async def start_ai_with_text(user_text: str):
                 await _flush_sentence_to_mobile(force=True)
 
         except asyncio.CancelledError:
+            was_cancelled = True
             raise
         except Exception as e:
             try:
@@ -1152,11 +1104,13 @@ async def start_ai_with_text(user_text: str):
                         try: sc.q.put_nowait(None)
                         except Exception: pass
 
-            final_text = ("".join(txt_buf)).strip() or "（空响应）"
-            try:
-                await ui_broadcast_final("[AI] " + final_text)
-            except Exception:
-                pass
+            # 被后续命令打断时，不再发布“空响应”，避免误导
+            if not was_cancelled:
+                final_text = ("".join(txt_buf)).strip() or "（空响应）"
+                try:
+                    await ui_broadcast_final("[AI] " + final_text)
+                except Exception:
+                    pass
 
     # 真正启动前先硬重置，保证**绝无**旧音频残留
     await hard_reset_audio("start_ai_with_text")
@@ -1203,34 +1157,39 @@ async def api_command(request: Request):
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/debug/gemini")
+async def api_debug_gemini(request: Request):
+    """
+    直接调用 Gemini 非流式 generateContent，返回原始 JSON，便于和官方文档字段对照调试。
+    """
+    try:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "text is empty"}
+        import aiohttp
+        from gemini_client import GEMINI_BASE, GEMINI_DEFAULT_MODEL, _gemini_api_key
+        model = (body.get("model") or GEMINI_DEFAULT_MODEL).strip()
+        url = f"{GEMINI_BASE.rstrip('/')}/{model}:generateContent"
+        req = {
+            "contents": [{"role": "user", "parts": [{"text": text}]}]
+        }
+        params = {"key": _gemini_api_key()}
+        timeout = aiohttp.ClientTimeout(total=60, sock_read=60)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, params=params, json=req) as resp:
+                raw = await resp.text()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {"raw": raw}
+                return {"ok": resp.status == 200, "status": resp.status, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # 注册 /stream.wav
 register_stream_route(app)
-
-
-@app.get("/api/chat-region")
-async def api_get_chat_region():
-    """当前对话后端：china=Qwen-Omni，international=Gemini。"""
-    return {
-        "region": get_chat_region(),
-        "override": chat_region_override,
-        "env_default": os.getenv("AIGLASS_CHAT_REGION", "china"),
-    }
-
-
-@app.post("/api/chat-region")
-async def api_set_chat_region(region: str = Body(..., embed=True)):
-    """切换对话区域：body JSON `{\"region\": \"china\"}` 或 `\"international\"`。"""
-    global chat_region_override
-    r = (region or "").strip().lower()
-    if r in ("china", "domestic", "cn", "国内", "qwen"):
-        chat_region_override = "china"
-    elif r in ("international", "overseas", "global", "国外", "gemini", "google"):
-        chat_region_override = "international"
-    else:
-        return {"ok": False, "error": "region must be china or international", "region": get_chat_region()}
-    print(f"[CHAT] region set to {chat_region_override}", flush=True)
-    return {"ok": True, "region": get_chat_region()}
-
 
 # ---------- WebSocket：WebUI 文本（ASR/AI 状态推送） ----------
 @app.websocket("/ws_ui")
@@ -1447,31 +1406,16 @@ async def ws_mobile_nav(ws: WebSocket):
     finally:
         mobile_nav_clients.discard(ws)
 
-# ---------- WebSocket：ESP32 相机入口（JPEG 二进制）；UDP 模式时关闭，由 UDP ingest 代替 ----------
+# ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
-    if CAMERA_UDP_ENABLED:
+    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, crosswalk_seg_model
+    if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
-    await camera_ingress_session(ws)
-
-
-async def camera_ingress_session(ws: Optional[WebSocket]):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, crosswalk_seg_model, camera_pipeline_running
-    if camera_pipeline_running:
-        if ws is not None:
-            await ws.close(code=1013)
-        return
-    if ws is not None:
-        if esp32_camera_ws is not None:
-            await ws.close(code=1013)
-            return
-        esp32_camera_ws = ws
-        await ws.accept()
-        print("[CAMERA] ESP32 connected (WebSocket)", flush=True)
-    else:
-        esp32_camera_ws = None
-        print("[CAMERA] UDP ingest (camera WebSocket disabled)", flush=True)
+    esp32_camera_ws = ws
+    await ws.accept()
+    print("[CAMERA] ESP32 connected")
     
     # 【新增】初始化盲道导航器
     if blind_path_navigator is None and segformer_bundle is not None:
@@ -1659,88 +1603,76 @@ async def camera_ingress_session(ws: Optional[WebSocket]):
     binary_buffer = bytearray()
     expected_jpeg_len: Optional[int] = None
 
-    if ws is not None:
-        async def drain_camera_ws():
-            nonlocal pending_meta, queue_drop_count, capture_clock_offset_ms, binary_buffer, expected_jpeg_len
-            try:
-                while True:
-                    msg = await ws.receive()
-                    if msg.get("type") in ("websocket.close", "websocket.disconnect"):
-                        try:
-                            frame_queue.put_nowait(None)
-                        except asyncio.QueueFull:
-                            frame_queue.get_nowait()
-                            frame_queue.put_nowait(None)
-                        return
-                    txt = msg.get("text")
-                    if txt:
-                        if txt.startswith("DROP:"):
-                            binary_buffer.clear()
-                            expected_jpeg_len = None
-                            continue
-                        meta = _parse_meta_text(txt)
-                        if meta is not None:
-                            pending_meta = meta
-                            expected_jpeg_len = meta.get("jpeg_len")
-                            binary_buffer.clear()
+    async def drain_camera_ws():
+        nonlocal pending_meta, queue_drop_count, capture_clock_offset_ms, binary_buffer, expected_jpeg_len
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg.get("type") in ("websocket.close", "websocket.disconnect"):
+                    try:
+                        frame_queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        frame_queue.get_nowait()
+                        frame_queue.put_nowait(None)
+                    return
+                txt = msg.get("text")
+                if txt:
+                    if txt.startswith("DROP:"):
+                        binary_buffer.clear()
+                        expected_jpeg_len = None
                         continue
-                    if msg.get("bytes"):
-                        binary_buffer.extend(msg["bytes"])
-                        if expected_jpeg_len is None or len(binary_buffer) < expected_jpeg_len:
-                            continue
-                        recv_ts = time.time()
-                        data = bytes(binary_buffer[:expected_jpeg_len])
-                        binary_buffer = binary_buffer[expected_jpeg_len:]
-                        if len(binary_buffer) > 0:
-                            binary_buffer.clear()
-                        cap_ts = pending_meta.get("capture_ts_ms")
-                        if cap_ts is not None:
-                            obs_off = (recv_ts * 1000.0) - float(cap_ts)
-                            if capture_clock_offset_ms is None:
-                                capture_clock_offset_ms = obs_off
-                            else:
-                                a = capture_offset_ema_alpha
-                                capture_clock_offset_ms = (1.0 - a) * capture_clock_offset_ms + a * obs_off
-                        packet = {
-                            "data": data,
-                            "recv_ts": recv_ts,
-                            "frame_id": pending_meta.get("frame_id"),
-                            "capture_ts_ms": pending_meta.get("capture_ts_ms"),
-                            "jpeg_len": expected_jpeg_len,
-                        }
+                    meta = _parse_meta_text(txt)
+                    if meta is not None:
+                        pending_meta = meta
+                        expected_jpeg_len = meta.get("jpeg_len")
+                        binary_buffer.clear()
+                    continue
+                if msg.get("bytes"):
+                    binary_buffer.extend(msg["bytes"])
+                    if expected_jpeg_len is None or len(binary_buffer) < expected_jpeg_len:
+                        continue
+                    recv_ts = time.time()
+                    data = bytes(binary_buffer[:expected_jpeg_len])
+                    binary_buffer = binary_buffer[expected_jpeg_len:]
+                    if len(binary_buffer) > 0:
+                        binary_buffer.clear()
+                    cap_ts = pending_meta.get("capture_ts_ms")
+                    if cap_ts is not None:
+                        obs_off = (recv_ts * 1000.0) - float(cap_ts)
+                        if capture_clock_offset_ms is None:
+                            capture_clock_offset_ms = obs_off
+                        else:
+                            a = capture_offset_ema_alpha
+                            capture_clock_offset_ms = (1.0 - a) * capture_clock_offset_ms + a * obs_off
+                    packet = {
+                        "data": data,
+                        "recv_ts": recv_ts,
+                        "frame_id": pending_meta.get("frame_id"),
+                        "capture_ts_ms": pending_meta.get("capture_ts_ms"),
+                        "jpeg_len": expected_jpeg_len,
+                    }
+                    try:
+                        frame_queue.put_nowait(packet)
+                    except asyncio.QueueFull:
+                        queue_drop_count += 1
                         try:
-                            frame_queue.put_nowait(packet)
-                        except asyncio.QueueFull:
-                            queue_drop_count += 1
-                            try:
-                                _ = frame_queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                pass
-                            frame_queue.put_nowait(packet)
-            except WebSocketDisconnect:
-                try:
-                    frame_queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
-            except Exception as e:
-                print(f"[CAMERA] drain task error: {e}")
-                try:
-                    frame_queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
-
-        drain_task = asyncio.create_task(drain_camera_ws())
-    else:
-        async def drain_camera_udp():
-            transport = await start_udp_camera_listener(frame_queue)
+                            _ = frame_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        frame_queue.put_nowait(packet)
+        except WebSocketDisconnect:
             try:
-                await asyncio.Future()
-            finally:
-                transport.close()
-
-        drain_task = asyncio.create_task(drain_camera_udp())
-
-    camera_pipeline_running = True
+                frame_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+        except Exception as e:
+            print(f"[CAMERA] drain task error: {e}")
+            try:
+                frame_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+    
+    drain_task = asyncio.create_task(drain_camera_ws())
     recorder_task = asyncio.create_task(recorder_worker()) if ENABLE_RECORDER else None
     viewer_task = asyncio.create_task(viewer_worker())
     nav_ui_task = asyncio.create_task(nav_ui_worker())
@@ -1973,13 +1905,12 @@ async def camera_ingress_session(ws: Optional[WebSocket]):
             except Exception:
                 pass
         try:
-            if ws is not None and (WebSocketState is None or ws.client_state == WebSocketState.CONNECTED):
+            if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
                 await ws.close(code=1000)
         except Exception:
             pass
         esp32_camera_ws = None
-        camera_pipeline_running = False
-        print("[CAMERA] camera pipeline stopped", flush=True)
+        print("[CAMERA] ESP32 disconnected")
 
 # ---------- WebSocket：浏览器订阅相机帧 ----------
 @app.websocket("/ws/viewer")
@@ -2206,8 +2137,6 @@ async def on_startup_init_audio():
 async def on_startup():
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
-    if CAMERA_UDP_ENABLED:
-        asyncio.create_task(camera_ingress_session(None))
 
 @app.on_event("shutdown")
 async def on_shutdown():
