@@ -30,6 +30,30 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# SegFormer（ADE20K）语义是「场景类别」，不是交规：
+# - road / runway 等车行表面与 sidewalk 都会出现在户外，不能把机动车道当盲道跟随目标。
+# - 自行车/摩托车/汽车多为「物体」类（如 bicycle、car），由障碍物检测分支处理，不当作可踏平面。
+# 默认仅将行人优先表面纳入可通行 mask；过马路仍走专用斑马线模型。
+_SEGFORMER_PEDESTRIAN_WALKABLE = frozenset({"sidewalk", "floor", "path"})
+# 与机动车冲突风险高的表面（仅当 AIGLASS_SEG_ALLOW_ROAD_SURFACE 开启时并入 mask）
+_SEGFORMER_VEHICLE_LIKE_SURFACE = frozenset({"road", "roadway", "pavement", "runway"})
+
+
+def _segformer_walkable_label_names() -> frozenset:
+    """当前帧使用的可通行类别名（归一化后与 id2label 逐项比对）。"""
+    names = set(_SEGFORMER_PEDESTRIAN_WALKABLE)
+    flag = os.getenv("AIGLASS_SEG_ALLOW_ROAD_SURFACE", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        names |= _SEGFORMER_VEHICLE_LIKE_SURFACE
+    extra = os.getenv("AIGLASS_SEG_WALKABLE_EXTRA", "").strip()
+    if extra:
+        for tok in extra.split(","):
+            t = tok.strip().lower().replace("_", " ").replace("-", " ")
+            if t:
+                names.add(t)
+    return frozenset(names)
+
+
 # ========== 状态常量定义 ==========
 STATE_ONBOARDING = "ONBOARDING"
 STATE_NAVIGATING = "NAVIGATING"
@@ -886,7 +910,8 @@ class BlindPathNavigator:
         """检测可通行区域（替代原盲道+斑马线 YOLO 分割）
 
         现在使用 SegFormer 语义分割模型：
-        - 可通行区域仅保留 sidewalk；
+        - 默认可通行区域仅含行人优先表面（sidewalk / floor / path），不含 road 等车行路面；
+        - 若需旧版「含机动车道」行为，设置环境变量 AIGLASS_SEG_ALLOW_ROAD_SURFACE=1；
         - 斑马线由专用分割模型提取（不走 SegFormer）。
         """
         h, w = image.shape[:2]
@@ -927,23 +952,18 @@ class BlindPathNavigator:
             pred = logits.argmax(dim=1)[0].cpu().numpy()  # [H, W]
 
             id2label = getattr(model.config, "id2label", {})
+            walkable_names = _segformer_walkable_label_names()
             free_space_ids = []
             for class_id, name in id2label.items():
-                # 扩展可通行区域：sidewalk + 各类地面/地板
                 name_l = str(name).lower().replace("_", " ").replace("-", " ").strip()
-                if name_l in (
-                    "sidewalk",
-                    "floor",
-                    "ground",
-                    "road",
-                    "roadway",
-                    "pavement",
-                    "path",
-                ):
+                if name_l in walkable_names:
                     free_space_ids.append(int(class_id))
 
             if not free_space_ids:
-                logger.warning("[BlindPath] SegFormer id2label 中未找到可通行类别（sidewalk/floor/ground/road...），返回全黑 mask")
+                logger.warning(
+                    "[BlindPath] SegFormer id2label 中未找到可通行类别（当前允许: %s），返回全黑 mask",
+                    sorted(walkable_names),
+                )
                 blind_path_mask = np.zeros((h, w), dtype=np.uint8)
             else:
                 mask_bool = np.isin(pred, np.array(free_space_ids, dtype=np.int32))
