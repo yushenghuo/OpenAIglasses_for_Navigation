@@ -66,7 +66,7 @@ from maps_navigation import (
 from navigation_destination import parse_navigation_destination
 import nav_tts
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -203,20 +203,13 @@ esp32_audio_ws: Optional[WebSocket] = None
 mobile_nav_clients: Set[WebSocket] = set()
 main_loop_for_mobile_tts: Optional[asyncio.AbstractEventLoop] = None
 
-# 对话后端：国内=Qwen-Omni（阿里云），国外=Gemini（Google）。可被 /api/chat-region 覆盖。
-chat_region_override: Optional[str] = None  # None 表示使用环境变量 AIGLASS_CHAT_REGION
-
 
 def get_chat_region() -> str:
-    """返回 china（Qwen）或 international（Gemini）。"""
-    global chat_region_override
-    if chat_region_override in ("china", "international"):
-        return chat_region_override
+    """china -> Qwen, international -> Gemini."""
     v = os.getenv("AIGLASS_CHAT_REGION", "china").strip().lower()
     if v in ("international", "overseas", "global", "gemini", "foreign", "国外"):
         return "international"
     return "china"
-
 
 # 【新增】盲道 / 可通行区域导航相关全局变量
 blind_path_navigator = None
@@ -1016,23 +1009,15 @@ async def start_ai_with_text_custom(user_text: str):
 # ========= Omni 播放启动 =========
 async def start_ai_with_text(user_text: str):
     """硬重置后，开启新的 AI 语音输出。"""
-    brief_chars = int(os.getenv("AIGLASS_CHAT_BRIEF_CHARS", "30"))
-    # 英文与「30 个中文字」信息量大致对应：约 8～15 个英文词（不精确，仅作软约束）
-    brief_words_en = int(os.getenv("AIGLASS_CHAT_BRIEF_WORDS_EN", "12"))
     concise_system_prompt = (
         "You are a concise visual assistant for blind users. "
-        "Follow ALL constraints strictly: "
-        "1) Same language as the user's latest input; "
-        "2) Exactly ONE short sentence unless impossible, then TWO at most; "
-        f"3) If Chinese: total <= {brief_chars} characters (including punctuation); "
-        f"   If English/other Latin script: total <= {brief_words_en} words; "
-        "4) No lists, bullets, headings, prefaces, or sign-offs; "
-        "5) State only the single most important visible fact for safe navigation; "
-        "6) End with a complete sentence."
+        "Use the same language as user input. "
+        "Keep answers very short and practical."
     )
     async def _runner():
         txt_buf: List[str] = []
         rate_state = None
+        was_cancelled = False
         _sentence_buf: List[str] = []  # 用于按句转发到 iPhone
 
         async def _flush_sentence_to_mobile(force: bool = False):
@@ -1070,29 +1055,20 @@ async def start_ai_with_text(user_text: str):
                 })
             except Exception:
                 pass
-        # 仅 system 时多模态模型常「听不进去」。把关键约束再放进 user 文本前（提高遵循率，仍非 100% 精确字数）
-        user_block = (
-            f"[STYLE: blind-user, brief. "
-            f"Chinese <= {brief_chars} chars; English <= {brief_words_en} words.]\n"
-            f"{user_text}"
-        )
-        content_list.append({"type": "text", "text": user_block})
+        content_list.append({"type": "text", "text": user_text})
 
         forward_to_phone = TTS_FORWARD_ONLY and bool(mobile_nav_clients)
 
-        chat_region = get_chat_region()
-        if chat_region == "international":
-            print("[CHAT] backend=Gemini (text stream; no Omni TTS on server)", flush=True)
-        else:
-            print("[CHAT] backend=Qwen-Omni (DashScope)", flush=True)
-
         try:
+            chat_region = get_chat_region()
             if chat_region == "international":
+                print("[CHAT] backend=Gemini (AIGLASS_CHAT_REGION=international)", flush=True)
                 stream_iter = stream_chat_gemini(
                     content_list,
                     system_prompt=concise_system_prompt,
                 )
             else:
+                print("[CHAT] backend=Qwen-Omni (AIGLASS_CHAT_REGION=china)", flush=True)
                 stream_iter = stream_chat(
                     content_list,
                     voice="Cherry",
@@ -1126,6 +1102,7 @@ async def start_ai_with_text(user_text: str):
                 await _flush_sentence_to_mobile(force=True)
 
         except asyncio.CancelledError:
+            was_cancelled = True
             raise
         except Exception as e:
             try:
@@ -1152,11 +1129,13 @@ async def start_ai_with_text(user_text: str):
                         try: sc.q.put_nowait(None)
                         except Exception: pass
 
-            final_text = ("".join(txt_buf)).strip() or "（空响应）"
-            try:
-                await ui_broadcast_final("[AI] " + final_text)
-            except Exception:
-                pass
+            # 被后续命令打断时，不再发布“空响应”，避免误导
+            if not was_cancelled:
+                final_text = ("".join(txt_buf)).strip() or "（空响应）"
+                try:
+                    await ui_broadcast_final("[AI] " + final_text)
+                except Exception:
+                    pass
 
     # 真正启动前先硬重置，保证**绝无**旧音频残留
     await hard_reset_audio("start_ai_with_text")
@@ -1203,34 +1182,39 @@ async def api_command(request: Request):
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/debug/gemini")
+async def api_debug_gemini(request: Request):
+    """
+    直接调用 Gemini 非流式 generateContent，返回原始 JSON，便于和官方文档字段对照调试。
+    """
+    try:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "text is empty"}
+        import aiohttp
+        from gemini_client import GEMINI_BASE, GEMINI_DEFAULT_MODEL, _gemini_api_key
+        model = (body.get("model") or GEMINI_DEFAULT_MODEL).strip()
+        url = f"{GEMINI_BASE.rstrip('/')}/{model}:generateContent"
+        req = {
+            "contents": [{"role": "user", "parts": [{"text": text}]}]
+        }
+        params = {"key": _gemini_api_key()}
+        timeout = aiohttp.ClientTimeout(total=60, sock_read=60)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, params=params, json=req) as resp:
+                raw = await resp.text()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {"raw": raw}
+                return {"ok": resp.status == 200, "status": resp.status, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # 注册 /stream.wav
 register_stream_route(app)
-
-
-@app.get("/api/chat-region")
-async def api_get_chat_region():
-    """当前对话后端：china=Qwen-Omni，international=Gemini。"""
-    return {
-        "region": get_chat_region(),
-        "override": chat_region_override,
-        "env_default": os.getenv("AIGLASS_CHAT_REGION", "china"),
-    }
-
-
-@app.post("/api/chat-region")
-async def api_set_chat_region(region: str = Body(..., embed=True)):
-    """切换对话区域：body JSON `{\"region\": \"china\"}` 或 `\"international\"`。"""
-    global chat_region_override
-    r = (region or "").strip().lower()
-    if r in ("china", "domestic", "cn", "国内", "qwen"):
-        chat_region_override = "china"
-    elif r in ("international", "overseas", "global", "国外", "gemini", "google"):
-        chat_region_override = "international"
-    else:
-        return {"ok": False, "error": "region must be china or international", "region": get_chat_region()}
-    print(f"[CHAT] region set to {chat_region_override}", flush=True)
-    return {"ok": True, "region": get_chat_region()}
-
 
 # ---------- WebSocket：WebUI 文本（ASR/AI 状态推送） ----------
 @app.websocket("/ws_ui")

@@ -10,6 +10,7 @@ import os
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import aiohttp
+from aiohttp_socks import ProxyConnector
 
 from omni_client import OmniStreamPiece
 
@@ -18,9 +19,9 @@ GEMINI_BASE = os.getenv(
     "GEMINI_API_BASE",
     "https://generativelanguage.googleapis.com/v1beta/models",
 )
-GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 # 优先使用环境变量 GEMINI_API_KEY；未设置时使用下列默认值（请在生产环境改为 .env）
-DEFAULT_GEMINI_API_KEY = "AIzaSyDmZhc6zFN_amglkj_EgF1B-pP2In2dbJo"
+DEFAULT_GEMINI_API_KEY = "AIzaSyBVghVJm1jE6KygV0YqEBUZosWW77Ds790"
 
 
 def _gemini_api_key() -> str:
@@ -61,6 +62,19 @@ def _extract_text_from_chunk(obj: Dict[str, Any]) -> str:
     return "".join(out)
 
 
+def _pick_proxy_url() -> Optional[str]:
+    """
+    代理优先级：
+    1) GEMINI_PROXY_URL（推荐，支持 socks5:// / socks5h:// / http://）
+    2) HTTPS_PROXY / HTTP_PROXY（兼容）
+    """
+    p = (os.getenv("GEMINI_PROXY_URL") or "").strip()
+    if p:
+        return p
+    p = (os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    return p or None
+
+
 async def stream_chat_gemini(
     content_list: List[Dict[str, Any]],
     system_prompt: Optional[str] = None,
@@ -73,7 +87,6 @@ async def stream_chat_gemini(
     """
     api_key = _gemini_api_key()
     m = model or GEMINI_DEFAULT_MODEL
-    url = f"{GEMINI_BASE.rstrip('/')}/{m}:streamGenerateContent"
     parts = _content_list_to_gemini_parts(content_list)
     if not parts:
         parts = [{"text": ""}]
@@ -92,17 +105,49 @@ async def stream_chat_gemini(
         "temperature": temperature,
     }
 
-    params = {"key": api_key}
-    timeout = aiohttp.ClientTimeout(total=300, sock_read=120)
+    # 官方流式建议使用 alt=sse，返回标准 SSE 行（data: {...}）
+    params = {"key": api_key, "alt": "sse"}
+    req_timeout_s = float(os.getenv("GEMINI_TOTAL_TIMEOUT_SEC", "60"))
+    read_timeout_s = float(os.getenv("GEMINI_READ_TIMEOUT_SEC", "20"))
+    timeout = aiohttp.ClientTimeout(total=req_timeout_s, sock_read=read_timeout_s)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, params=params, json=body) as resp:
+    proxy_url = _pick_proxy_url()
+    connector = None
+    request_kwargs: Dict[str, Any] = {}
+    if proxy_url:
+        low = proxy_url.lower()
+        if low.startswith(("socks5://", "socks5h://", "socks4://", "socks4a://")):
+            connector = ProxyConnector.from_url(proxy_url)
+        else:
+            # aiohttp 原生支持 http/https 代理
+            request_kwargs["proxy"] = proxy_url
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
+        url = f"{GEMINI_BASE.rstrip('/')}/{m}:streamGenerateContent"
+        try:
+            resp = await session.post(url, params=params, json=body, **request_kwargs)
+        except TimeoutError:
+            raise RuntimeError(f"Gemini request timeout @ {m}") from None
+        except aiohttp.ServerTimeoutError:
+            raise RuntimeError(f"Gemini request timeout @ {m}") from None
+        except Exception as e:
+            raise RuntimeError(f"Gemini request failed @ {m}: {e}") from None
+
+        async with resp:
             if resp.status != 200:
                 err_text = await resp.text()
-                raise RuntimeError(f"Gemini HTTP {resp.status}: {err_text[:500]}")
+                if resp.status == 408:
+                    raise RuntimeError(f"Gemini request timeout @ {m}: {err_text[:300]}")
+                raise RuntimeError(f"Gemini HTTP {resp.status} @ {m}: {err_text[:500]}")
+            if proxy_url:
+                print(f"[GEMINI] stream opened model={m}, status={resp.status}, proxy={proxy_url}", flush=True)
+            else:
+                print(f"[GEMINI] stream opened model={m}, status={resp.status}, proxy=direct", flush=True)
 
             buffer = b""
             accumulated = ""
+            saw_any_event = False
+            last_finish_reason: Optional[str] = None
             async for chunk in resp.content.iter_chunked(4096):
                 if not chunk:
                     continue
@@ -120,9 +165,24 @@ async def stream_chat_gemini(
                         obj = json.loads(line.decode("utf-8"))
                     except Exception:
                         continue
+                    saw_any_event = True
                     if "error" in obj:
                         msg = obj.get("error", {})
                         raise RuntimeError(f"Gemini API error: {msg}")
+                    try:
+                        cands = obj.get("candidates") or []
+                        if cands:
+                            fr = cands[0].get("finishReason")
+                            if fr:
+                                last_finish_reason = str(fr)
+                    except Exception:
+                        pass
+                    # 官方文档：当被安全策略拦截时，可能只有 promptFeedback 无 candidates
+                    if "promptFeedback" in obj and not (obj.get("candidates") or []):
+                        pf = obj.get("promptFeedback") or {}
+                        br = pf.get("blockReason")
+                        if br:
+                            raise RuntimeError(f"Gemini prompt blocked: {br}")
                     piece = _extract_text_from_chunk(obj)
                     if not piece:
                         continue
@@ -142,6 +202,7 @@ async def stream_chat_gemini(
                     if line.startswith(b"data:"):
                         line = line[5:].strip()
                     obj = json.loads(line.decode("utf-8"))
+                    saw_any_event = True
                     piece = _extract_text_from_chunk(obj)
                     if piece:
                         if piece.startswith(accumulated):
@@ -152,3 +213,11 @@ async def stream_chat_gemini(
                             yield OmniStreamPiece(text_delta=delta, audio_b64=None)
                 except Exception:
                     pass
+
+            # 避免“静默空响应”：明确给上层错误原因，便于日志定位
+            if not accumulated.strip():
+                reason = f", finish_reason={last_finish_reason}" if last_finish_reason else ""
+                if saw_any_event:
+                    raise RuntimeError(f"Gemini returned no text content{reason}")
+                raise RuntimeError("Gemini stream returned no events")
+            print(f"[GEMINI] stream done chars={len(accumulated)} finish={last_finish_reason}", flush=True)
