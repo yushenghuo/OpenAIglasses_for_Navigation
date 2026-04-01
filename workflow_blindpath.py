@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 from obstacle_detector_client import ObstacleDetectorClient
 from audio_player import play_voice_text
-from nav_tts import play_voice_text_for_nav
+from nav_tts import play_voice_text_for_nav, reset_nav_flip_state
 from crosswalk_awareness import CrosswalkAwarenessMonitor, split_combined_voice
 from device_utils import get_device
 # 尝试导入 Pillow，用于中文显示
@@ -204,7 +204,8 @@ class BlindPathNavigator:
         self.straight_repeat_count = 0
         
         # 【新增】方向指令持续播报配置
-        self.direction_interval = float(os.getenv("AIGLASS_DIRECTION_INTERVAL", "3.0"))  # 方向指令间隔（秒）
+        # 同一条方向文案的重复播报间隔（秒）；新方向文案不受此限（由 nav_tts 防左右跳）
+        self.direction_interval = float(os.getenv("AIGLASS_DIRECTION_INTERVAL", "1.2"))
         self.last_direction_time = 0.0
         self.last_direction_message = ""
         
@@ -230,7 +231,6 @@ class BlindPathNavigator:
         self.last_guidance_message = ""
         self.last_detected_obstacles = []
         self.last_obstacle_detection_frame = 0
-        self.last_any_speech_time = 0
         
         # 斑马线准备状态标志
         self.crosswalk_ready_announced = False
@@ -776,69 +776,48 @@ class BlindPathNavigator:
             voice_candidates.sort(key=lambda x: x['priority'], reverse=True)
             selected_voice = voice_candidates[0]
             final_guidance_text = selected_voice['text']
-            
-            # 全局播报冷却（避免任何语音重叠）
-            MIN_SPEECH_INTERVAL = 1.2  # 任意两条语音间隔至少0.8秒
-            if hasattr(self, 'last_any_speech_time'):
-                if current_time - self.last_any_speech_time < MIN_SPEECH_INTERVAL:
-                    final_guidance_text = ""  # 太快了，跳过这次播报
-            
-            # 特殊处理保持直行的节流
+            pending_new_direction = False
+
+            # 不再做全局 1.2s 语音冷却：本地播放由 audio 队列串行「播完再接下一条」；
+            # 手机转发端可根据 payload.serial_nav 自行排队。
+
+            # 保持直行的节拍（避免同一句刷屏）
             if final_guidance_text == "保持直行":
                 if self.straight_continuous_mode:
-                    # 持续播报模式：只检查时间间隔
                     if current_time - self.last_guide_time >= self.guide_interval:
                         self.last_guide_time = current_time
                         self.straight_repeat_count += 1
-                        self.last_any_speech_time = current_time
                     else:
                         final_guidance_text = ""
                 else:
-                    # 原有的限制模式
                     if (current_time - self.last_guide_time >= self.guide_interval) and \
                        (self.straight_repeat_count < self.straight_repeat_limit):
                         self.last_guide_time = current_time
                         self.straight_repeat_count += 1
-                        self.last_any_speech_time = current_time
                     else:
                         final_guidance_text = ""
             elif final_guidance_text and selected_voice['source'] != 'obstacle':
-                # 【修改】非直行、非障碍物指令 - 支持方向指令持续播报
-                # 判断是否是方向指令
                 direction_keywords = ["左转", "右转", "左移", "右移", "向左", "向右", "平移", "微调"]
                 is_direction = any(keyword in final_guidance_text for keyword in direction_keywords)
-                
+
                 if is_direction:
-                    # 方向指令：支持持续播报
                     if final_guidance_text == self.last_direction_message:
-                        # 同一个方向指令，检查时间间隔
                         if current_time - self.last_direction_time >= self.direction_interval:
                             self.last_direction_time = current_time
-                            self.last_any_speech_time = current_time
                             self.straight_repeat_count = 0
                         else:
-                            final_guidance_text = ""  # 时间间隔不够，跳过
+                            final_guidance_text = ""
                     else:
-                        # 新的方向指令，立即播报
-                        self.last_direction_message = final_guidance_text
-                        self.last_direction_time = current_time
-                        self.last_any_speech_time = current_time
+                        # 新方向文案：等真正播成功后再写入 last_direction_message（防 nav 层抑制翻转时状态错乱）
+                        pending_new_direction = True
                         self.straight_repeat_count = 0
                 else:
-                    # 其他指令：只播报一次
                     if final_guidance_text != self.last_guidance_message:
                         self.last_guidance_message = final_guidance_text
                         self.straight_repeat_count = 0
-                        self.last_any_speech_time = current_time
                     else:
                         final_guidance_text = ""
-            elif final_guidance_text and selected_voice['source'] == 'obstacle':
-                # 障碍物语音总是播报
-                self.last_any_speech_time = current_time
-            elif final_guidance_text and selected_voice['source'] == 'crosswalk':
-                # 斑马线语音总是播报（不受重复检查限制）
-                self.last_any_speech_time = current_time
-                
+
             # 播报选中的语音
             if final_guidance_text:
                 try:
@@ -846,19 +825,19 @@ class BlindPathNavigator:
                     if selected_voice.get('source') == 'crosswalk' and ',' in final_guidance_text:
                         voice_parts = split_combined_voice(final_guidance_text)
                         logger.info(f"[斑马线语音] 组合播报检测到{len(voice_parts)}部分，只播第一部分保持实时")
-                        # 只播放第一部分，后续部分丢弃以保持实时性
                         if voice_parts:
-                            # 斑马线语音优先级最高：直接走基础播放接口，不受地图节流影响
                             play_voice_text(voice_parts[0])
                             logger.info(f"[语音播报] 优先级{selected_voice['priority']}: {voice_parts[0]}")
                     elif selected_voice.get('source') == 'crosswalk':
-                        # 非组合句的斑马线语音，同样绕过地图节流
                         play_voice_text(final_guidance_text)
                         logger.info(f"[语音播报] 优先级{selected_voice['priority']}: {final_guidance_text}")
                     else:
-                        # 其余导航提示（可通行区域、普通障碍物等）仍然走导航节流逻辑
-                        play_voice_text_for_nav(final_guidance_text)
-                        logger.info(f"[语音播报] 优先级{selected_voice['priority']}: {final_guidance_text}")
+                        ok = play_voice_text_for_nav(final_guidance_text)
+                        if ok and pending_new_direction:
+                            self.last_direction_message = final_guidance_text
+                            self.last_direction_time = current_time
+                        if ok:
+                            logger.info(f"[语音播报] 优先级{selected_voice['priority']}: {final_guidance_text}")
                 except Exception as e:
                     logger.error(f"[语音播报] 播放失败: {e}")
         else:
@@ -4013,7 +3992,7 @@ class BlindPathNavigator:
         self.last_obstacle_detection_frame = 0
         self.last_obstacle_speech = ""
         self.last_obstacle_speech_time = 0
-        self.last_any_speech_time = 0
+        reset_nav_flip_state()
         self.crosswalk_ready_announced = False
         self.crosswalk_ready_time = 0
         self.traffic_light_history.clear()

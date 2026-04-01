@@ -55,8 +55,8 @@ AUDIO_MAP = {
 # 音频缓存，避免重复读取
 _audio_cache = {}
 
-# 音频播放队列和工作线程 - 使用优先级队列
-_audio_queue = queue.PriorityQueue(maxsize=10)
+# 音频播放队列和工作线程 - 使用优先级队列（略增大以便导航串行排队）
+_audio_queue = queue.PriorityQueue(maxsize=32)
 _audio_priority = 0  # 递增的优先级计数器
 _worker_thread = None
 _worker_loop = None
@@ -76,8 +76,12 @@ def set_tts_forwarder(forwarder: Optional[Callable[[Dict[str, Any]], None]]) -> 
     _tts_forwarder = forwarder
 
 
-def _enqueue_pcm(pcm_data: bytes):
-    """将已是 8kHz 单声道 PCM16 的数据放入播放队列（线程安全）。"""
+def _enqueue_pcm(pcm_data: bytes, coalesce_latest: bool = True):
+    """将已是 8kHz 单声道 PCM16 的数据放入播放队列（线程安全）。
+
+    coalesce_latest=True（默认）：丢弃积压，尽量只播最新一条（非导航场景）。
+    coalesce_latest=False（导航串行）：FIFO 排队，当前段播完再播下一段，不中途清空队列。
+    """
     global _audio_queue, _audio_priority
 
     if not _initialized:
@@ -86,25 +90,33 @@ def _enqueue_pcm(pcm_data: bytes):
     if not pcm_data:
         return
 
-    # 队列实时策略与 play_audio_threadsafe 一致
     queue_size = _audio_queue.qsize()
     with _playing_lock:
         currently_playing = _is_playing
 
-    if queue_size > 0 and not currently_playing:
-        print(f"[AUDIO] 清空队列（当前{queue_size}个），播放最新语音")
-        _audio_queue = queue.PriorityQueue(maxsize=10)
-    elif queue_size > 1 and currently_playing:
-        print(f"[AUDIO] 队列积压({queue_size}个)，清空以保持实时")
-        _audio_queue = queue.PriorityQueue(maxsize=10)
+    if coalesce_latest:
+        if queue_size > 0 and not currently_playing:
+            print(f"[AUDIO] 清空队列（当前{queue_size}个），播放最新语音")
+            _audio_queue = queue.PriorityQueue(maxsize=32)
+        elif queue_size > 1 and currently_playing:
+            print(f"[AUDIO] 队列积压({queue_size}个)，清空以保持实时")
+            _audio_queue = queue.PriorityQueue(maxsize=32)
 
     try:
         _audio_priority += 1
         _audio_queue.put_nowait((_audio_priority, pcm_data))
-        if queue_size >= 1:
+        if queue_size >= 1 and coalesce_latest:
             print(f"[AUDIO] 播放队列当前大小: {queue_size + 1}")
     except queue.Full:
-        print("[AUDIO] 队列满，丢弃一条 TTS 语音")
+        if not coalesce_latest:
+            try:
+                _audio_queue.get_nowait()
+                _audio_queue.put_nowait((_audio_priority, pcm_data))
+                print("[AUDIO] 导航队列满，丢弃队首一条以插入新导航语")
+            except Exception:
+                print("[AUDIO] 队列满，丢弃导航 TTS")
+        else:
+            print("[AUDIO] 队列满，丢弃一条 TTS 语音")
         return
 
 def load_wav_file(filepath):
@@ -305,8 +317,8 @@ def initialize_audio_system():
     print("[AUDIO] 音频系统初始化完成（预加载+工作线程）")
 
 
-def play_audio_threadsafe(audio_key):
-    """线程安全的音频播放函数"""
+def play_audio_threadsafe(audio_key, nav_serial: bool = False):
+    """线程安全的音频播放函数。nav_serial=True 时导航语音 FIFO 排队、播完再接下一条。"""
     global _audio_queue, _audio_priority
     
     if not _initialized:
@@ -329,7 +341,7 @@ def play_audio_threadsafe(audio_key):
             print(f"[AUDIO] 解压失败: {audio_key}")
             return
     
-    _enqueue_pcm(pcm_data)
+    _enqueue_pcm(pcm_data, coalesce_latest=not nav_serial)
 
 # 全局语音节流
 _last_voice_time = 0
@@ -347,29 +359,29 @@ VOICE_PRIORITY = {
 
 _CN_TO_EN: Dict[str, str] = {
     # -- obstacle --
-    "前方有人，注意避让。": "Person ahead, watch out.",
-    "前方有车，注意避让。": "Car ahead, watch out.",
-    "前方有自行车，停一下。": "Bicycle ahead, stop.",
-    "前方有摩托车，停一下。": "Motorcycle ahead, stop.",
-    "前方有公交车，停一下。": "Bus ahead, stop.",
-    "前方有卡车，停一下。": "Truck ahead, stop.",
-    "前方有电瓶车，停一下。": "Scooter ahead, stop.",
-    "前方有婴儿车，停一下。": "Stroller ahead, stop.",
-    "前方有狗，停一下。": "Dog ahead, stop.",
-    "前方有动物，停一下。": "Animal ahead, stop.",
-    "前方有障碍物，注意避让。": "Obstacle ahead, watch out.",
+    "前方有人，注意避让。": "Person ahead",
+    "前方有车，注意避让。": "Car ahead",
+    "前方有自行车，停一下。": "Bicycle ahead",
+    "前方有摩托车，停一下。": "Motorcycle ahead",
+    "前方有公交车，停一下。": "Bus ahead",
+    "前方有卡车，停一下。": "Truck ahead",
+    "前方有电瓶车，停一下。": "Scooter ahead",
+    "前方有婴儿车，停一下。": "Stroller ahead",
+    "前方有狗，停一下。": "Dog ahead.",
+    "前方有动物，停一下。": "Animal ahead",
+    "前方有障碍物，注意避让。": "Obstacle ahead",
     # -- no-path / stop --
-    "请停下，前方无路": "Stop, no path ahead.",
+    "请停下，前方无路": "no path ahead.",
     "请停下": "Please stop.",
     "前方无路": "No path ahead.",
     # -- direction / navigation --
-    "保持直行": "Keep going straight.",
-    "向左移动一点": "Move slightly to the left.",
-    "向右移动一点": "Move slightly to the right.",
-    "稍微向左靠一点": "Move a bit to the left.",
-    "稍微向右靠一点": "Move a bit to the right.",
-    "请向左微调方向": "Adjust slightly to the left.",
-    "请向右微调方向": "Adjust slightly to the right.",
+    "保持直行": "Keep straight.",
+    "向左移动一点": "Move left.",
+    "向右移动一点": "Move right.",
+    "稍微向左靠一点": "Move left.",
+    "稍微向右靠一点": "Move right.",
+    "请向左微调方向": "Adjust left.",
+    "请向右微调方向": "Adjust right.",
     "向左": "Move left.",
     "向右": "Move right.",
     "左转": "Turn left.",
@@ -377,29 +389,29 @@ _CN_TO_EN: Dict[str, str] = {
     "左移": "Shift left.",
     "右移": "Shift right.",
     # -- onboarding / calibration --
-    "方向已对正！现在校准位置。": "Direction aligned! Now calibrating position.",
-    "请向左转动。": "Please turn left.",
-    "请向右转动。": "Please turn right.",
-    "校准完成！您已在盲道上，开始前行。": "Calibration complete! You are on the path, start walking.",
-    "请向左平移。": "Please shift left.",
-    "请向右平移。": "Please shift right.",
-    "请向前移动，让盲道更清晰。": "Move forward to get a clearer path.",
+    "方向已对正！现在校准位置。": "Direction aligned",
+    "请向左转动。": "turn left.",
+    "请向右转动。": "turn right.",
+    "校准完成！您已在盲道上，开始前行。": "Calibration complete",
+    "请向左平移。": "shift left.",
+    "请向右平移。": "shift right.",
+    "请向前移动，让盲道更清晰。": "Move forward",
     # -- maneuvering / avoidance --
-    "检测到已移动，开始对准新方向。": "Movement detected, aligning to new direction.",
+    "检测到已移动，开始对准新方向。": "aligning to new direction.",
     "已对准新路径，请向前直行。": "Aligned to new path, go straight ahead.",
-    "好的，请停下侧移。": "OK, stop shifting.",
+    "好的，请停下侧移。": "stop shifting.",
     "已回到盲道。": "Back on the path.",
-    "向右平移，对准盲道": "Shift right to align with the path.",
-    "向左平移，对准盲道": "Shift left to align with the path.",
+    "向右平移，对准盲道": "Shift right",
+    "向左平移，对准盲道": "Shift left",
     "丢失路径，重新搜索。": "Path lost, searching again.",
     "避让完成，已回到盲道。": "Avoidance complete, back on the path.",
     "向前直行几步越过障碍物。然后说'好了'。": "Walk a few steps forward past the obstacle.",
     "请继续向左平移。": "Keep shifting left.",
     "请继续向右平移。": "Keep shifting right.",
-    "请向左微调，对准盲道。": "Adjust left to align with the path.",
-    "请向右微调，对准盲道。": "Adjust right to align with the path.",
+    "请向左微调，对准盲道。": "Adjust left",
+    "请向右微调，对准盲道。": "Adjust right",
     # -- crosswalk --
-    "已对准, 准备切换过马路模式。": "Aligned, ready to switch to crossing mode.",
+    "已对准, 准备切换过马路模式。": "Aligned, switch to crossing mode.",
     "绿灯稳定，开始通行。": "Green light stable, start crossing.",
     "正在等待绿灯…": "Waiting for green light.",
     "正在接近斑马线，为您对准方向。": "Approaching crosswalk, aligning direction.",
@@ -407,31 +419,31 @@ _CN_TO_EN: Dict[str, str] = {
     "斑马线到了可以过马路": "Crosswalk reached, you can cross now.",
     "远处发现斑马线，继续直行。": "Crosswalk spotted ahead, keep going straight.",
     # -- crosswalk awareness (with dynamic position) --
-    "远处发现斑马线,在画面左侧": "Crosswalk spotted far ahead, on the left.",
-    "远处发现斑马线,在画面中间": "Crosswalk spotted far ahead, in the center.",
-    "远处发现斑马线,在画面右侧": "Crosswalk spotted far ahead, on the right.",
-    "正在靠近斑马线,在画面左侧": "Approaching crosswalk, on the left.",
-    "正在靠近斑马线,在画面中间": "Approaching crosswalk, in the center.",
-    "正在靠近斑马线,在画面右侧": "Approaching crosswalk, on the right.",
-    "接近斑马线,在画面左侧": "Near crosswalk, on the left.",
-    "接近斑马线,在画面中间": "Near crosswalk, in the center.",
-    "接近斑马线,在画面右侧": "Near crosswalk, on the right.",
+    "远处发现斑马线,在画面左侧": "Crosswalk far left.",
+    "远处发现斑马线,在画面中间": "Crosswalk far center.",
+    "远处发现斑马线,在画面右侧": "Crosswalk far right.",
+    "正在靠近斑马线,在画面左侧": "Approaching crosswalk left.",
+    "正在靠近斑马线,在画面中间": "Approaching crosswalk center.",
+    "正在靠近斑马线,在画面右侧": "Approaching crosswalk right.",
+    "接近斑马线,在画面左侧": "Near crosswalk left.",
+    "接近斑马线,在画面中间": "Near crosswalk center.",
+    "接近斑马线,在画面右侧": "Near crosswalk right.",
     # -- crossing mode (from app_main) --
     "过马路模式已启动。": "Crossing mode started.",
     "启动过马路模式失败，请稍后重试。": "Failed to start crossing mode, try again later.",
     "已停止导航。": "Navigation stopped.",
     # -- traffic light --
-    "红灯，请等待。": "Red light, please wait.",
-    "绿灯，可以通行。": "Green light, you can go.",
-    "黄灯，注意。": "Yellow light, be careful.",
+    "红灯，请等待。": "Red light",
+    "绿灯，可以通行。": "Green light",
+    "黄灯，注意。": "Yellow light",
 }
 
 _CN_SUBSTR_EN = [
-    ("前方有", "注意避让", lambda mid: f"{mid} ahead, watch out."),
-    ("前方有", "停一下", lambda mid: f"{mid} ahead, stop."),
-    ("路径被挡住", "侧平移", lambda _: "Path blocked, shift to the side."),
+    ("前方有", "注意避让", lambda mid: f"{mid} ahead"),
+    ("前方有", "停一下", lambda mid: f"{mid} ahead"),
+    ("路径被挡住", "侧平移", lambda _: "Path blocked"),
     ("请继续向", "平移", lambda d: f"Keep shifting {d}."),
-    ("请向", "微调，对准盲道", lambda d: f"Adjust {d} to align with the path."),
+    ("请向", "微调，对准盲道", lambda d: f"Adjust {d}"),
     ("请向", "平移。", lambda d: f"Please shift {d}."),
     ("请向", "转动。", lambda d: f"Please turn {d}."),
 ]
@@ -527,23 +539,26 @@ def _classify_tts_channel_and_priority(text: str) -> Dict[str, Any]:
     return {"channel": "server_tts", "priority": VOICE_PRIORITY.get("other", 30)}
 
 # 新增：根据中文提示文案直接播放（会做轻度规范化与降级）
-def play_voice_text(text: str):
+def play_voice_text(text: str, *, nav_serial: bool = False) -> bool:
     """
     传入中文提示，自动匹配 voice 映射并播放。
     - 尝试原文
     - 尝试补全/去除句末标点（。.!！?？）
     - 若包含“前方有…注意避让”但未命中，降级到“前方有障碍物，注意避让。”
+    - nav_serial=True：导航用 FIFO 入队 + 不应用「同句 1s」冷却（由上层与 nav_tts 去重/防抖）。
+    返回是否已成功下发（转发或入队播放）。
     """
     global _last_voice_time, _last_voice_text
 
     if not text:
-        return
+        return False
     if not _initialized:
         initialize_audio_system()
 
     current_time = time.time()
-    if text == _last_voice_text and current_time - _last_voice_time < _voice_cooldown:
-        return
+    if not nav_serial:
+        if text == _last_voice_text and current_time - _last_voice_time < _voice_cooldown:
+            return False
 
     def _forward(text_for_mobile: str, resolved_key: Optional[str] = None) -> bool:
         if not (_tts_forward_only and _tts_forwarder):
@@ -559,6 +574,8 @@ def play_voice_text(text: str):
             "timestamp": time.time(),
             "resolved_key": resolved_key or "",
         }
+        if nav_serial:
+            payload["serial_nav"] = True
         try:
             _tts_forwarder(payload)
             return True
@@ -568,11 +585,11 @@ def play_voice_text(text: str):
 
     norm_text = text.strip()
     if "路径特征提取失败" in norm_text:
-        return
+        return False
     if "向左移动" in norm_text:
-        norm_text = "向左"
+        norm_text = "move left"
     elif "向右移动" in norm_text:
-        norm_text = "向右"
+        norm_text = "move right"
 
     candidates = [norm_text]
     if norm_text[-1:] not in ("。", "！", "!", "？", "?", "."):
@@ -587,51 +604,52 @@ def play_voice_text(text: str):
             if _forward(ck, resolved_key=ck):
                 _last_voice_text = text
                 _last_voice_time = current_time
-                return
-            play_audio_threadsafe(ck)
+                return True
+            play_audio_threadsafe(ck, nav_serial=nav_serial)
             _last_voice_text = text
             _last_voice_time = current_time
-            return
+            return True
 
     if ("前方有" in norm_text) and ("注意避让" in norm_text):
-        fallback = "前方有障碍物，注意避让。"
+        fallback = "Obstacle ahead"
         if fallback in AUDIO_MAP:
             if _forward(fallback, resolved_key=fallback):
                 _last_voice_text = text
                 _last_voice_time = current_time
-                return
-            play_audio_threadsafe(fallback)
+                return True
+            play_audio_threadsafe(fallback, nav_serial=nav_serial)
             _last_voice_text = text
             _last_voice_time = current_time
-            return
+            return True
 
     base = norm_text.rstrip("。.!！?？")
     if base in AUDIO_MAP:
         if _forward(base, resolved_key=base):
             _last_voice_text = text
             _last_voice_time = current_time
-            return
-        play_audio_threadsafe(base)
+            return True
+        play_audio_threadsafe(base, nav_serial=nav_serial)
         _last_voice_text = text
         _last_voice_time = current_time
-        return
+        return True
     if base + "。" in AUDIO_MAP:
         full = base + "。"
         if _forward(full, resolved_key=full):
             _last_voice_text = text
             _last_voice_time = current_time
-            return
-        play_audio_threadsafe(full)
+            return True
+        play_audio_threadsafe(full, nav_serial=nav_serial)
         _last_voice_text = text
         _last_voice_time = current_time
-        return
+        return True
 
     # 无预录映射时，仍下发给 iPhone 端（由 iOS TTS 中心兜底合成）。
     if _forward(norm_text):
         _last_voice_text = text
         _last_voice_time = current_time
-        return
+        return True
     print(f"[AUDIO] 未找到匹配语音: {text}")
+    return False
 
 # 兼容旧接口
 play_audio_on_esp32 = play_audio_threadsafe
