@@ -21,14 +21,13 @@ GEMINI_BASE = os.getenv(
 )
 GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 # 优先使用环境变量 GEMINI_API_KEY；未设置时使用下列默认值（请在生产环境改为 .env）
-DEFAULT_GEMINI_API_KEY = "AIzaSyBVghVJm1jE6KygV0YqEBUZosWW77Ds790"
 
 
 def _gemini_api_key() -> str:
     key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if key:
         return key
-    return DEFAULT_GEMINI_API_KEY
+    return ""
 
 
 def _content_list_to_gemini_parts(content_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
